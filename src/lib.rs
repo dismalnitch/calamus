@@ -1,4 +1,5 @@
 pub mod buffer;
+pub mod caret;
 pub mod display;
 pub mod layout;
 pub mod units;
