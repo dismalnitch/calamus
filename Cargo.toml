@@ -4,4 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+demerits = { git = "https://github.com/Ganderworks/demerits", rev = "d555ac9", version = "0.1.0" }
 ropey = "1.6.1"
+rustybuzz = "0.20.1"
+unicode-linebreak = "0.1.5"
+unicode-segmentation = "1.13.3"
+
+# Shaping is slow unoptimized; build the dependencies optimized even in dev
+# and test builds.
+[profile.dev.package."*"]
+opt-level = 3

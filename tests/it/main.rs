@@ -11,5 +11,5 @@ mod common;
 
 mod buffer;
 // mod display;
-// mod layout;
+mod layout;
 // mod units;
