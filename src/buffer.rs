@@ -1,7 +1,7 @@
 //! buffer
 //!
 //!
-use std::fmt;
+use std::{fmt, range::Range};
 
 pub struct Buffer {
     buffer: ropey::Rope,
@@ -53,6 +53,20 @@ impl Buffer {
         Self {
             buffer: ropey::Rope::new(),
         }
+    }
+
+    pub fn replace(&mut self, range: Range<usize>, text: &str) -> Result<usize, BufferError> {
+        let len = self.buffer.len_chars();
+
+        if range.start > range.end || range.end > len {
+            return Err(BufferError::RangeOutOfBounds {
+                at: range.start,
+                end: range.end,
+                len,
+            });
+        }
+        self.buffer.remove(range);
+        self.insert(range.start, text)
     }
 
     /// Inserts `text` at char index `at`. Returns the number of chars added.
