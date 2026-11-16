@@ -1,13 +1,13 @@
 //! units
 
-pub enum Direction {
-    N,
-    E,
-    W,
-    S,
+pub enum Heading {
+    North,
+    East,
+    West,
+    South,
 }
 
 pub struct Offset {
-    offset: usize,
-    due: Direction,
+    pub offset: usize,
+    pub due: Heading,
 }

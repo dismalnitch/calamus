@@ -61,7 +61,7 @@
 //!   where a ligature's carets go, in the GDEF table's ligature caret list;
 //!   even shares are the usual fallback.)
 //! - *Several glyphs, one cluster:* a letter and its accent drawn as two
-//!   glyphs, or an Indic syllable. One stop, at the cluster's start.
+//!   glyphs, or an Indic syllable. One stop, at the cluster's start
 //!   [`Glyph::cluster`](crate::layout::Glyph::cluster) says where each glyph's characters begin; glyphs
 //!   sharing a cluster value belong together.
 //!
@@ -71,7 +71,7 @@
 //! than the line's end.
 //!
 //! **One offset, two places: affinity.** Where a line breaks softly, the
-//! offset after the break is both the end of one line and the start of the
+//! offset after the break is both the end of one line and the start of th
 //! next. The cursor can show at either: after the last word of line 3, or
 //! before the first word of line 4. UIKit calls this the position's
 //! *affinity* (upstream: the line before; downstream: the line after). It
@@ -117,3 +117,64 @@
 //! of one line and the first of the next share an offset; in left-to-right
 //! text, x never decreases along the stops; no stop lies past the line's
 //! width.
+//!
+
+use crate::units::{Heading, Offset};
+
+pub enum Affinity {
+    Upstream,
+    Downstream,
+}
+
+pub struct Caret {
+    pub position: Offset,
+    pub affinity: Affinity,
+    text: &str,
+}
+
+// impl Default for Caret {
+//     fn default(text: &str) -> Self {
+//         Self {
+//             position: Offset {
+//                 offset: 0,
+//                 due: Heading::East,
+//                 text: text,
+//             },
+//             affinity: Affinity::Downstream,
+//         }
+//     }
+// }
+use unicode_segmentation::UnicodeSegmentation;
+
+impl Caret {
+    // TODO: add options
+    pub fn new(text: &str) -> Self {
+        Self {
+            position: Offset {
+                offset: 0,
+                due: Heading::East,
+            },
+            affinity: Affinity::Downstream,
+            text,
+        }
+    }
+
+    // interface:
+    // fn position - gets the caret position in em at this grapheme/glyph/cluster location
+    // fn line - gets the line index of this grapheme/glyph/cluster
+    // fn
+    // fn
+    // where is the cursor? (at this place in the text (rectangle))
+    // I touched <here>, which place in the text is that?
+    // which rectangles cover this selection? (boxes and spaces)
+    // what place is one line above this location? below?
+
+    pub fn position(&self) {
+        if self.position.offset >= self.text.len() {
+            panic!("at the disco")
+        }
+        let g = self.text.grapheme_indices(true);
+        // self.text[self.position.offset]
+        todo!();
+    }
+}
