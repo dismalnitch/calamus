@@ -4,18 +4,7 @@ pub mod display;
 pub mod layout;
 pub mod units;
 
-pub enum Direction {
-    N,
-    E,
-    W,
-    S,
-}
-
 use buffer::Buffer;
-pub struct Offset {
-    offset: usize,
-    due: Direction,
-}
 
 pub struct Editor {
     cursor: usize,
