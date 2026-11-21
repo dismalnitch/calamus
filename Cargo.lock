@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "arrayvec"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -19,7 +25,7 @@ name = "calamus"
 version = "0.1.0"
 dependencies = [
  "demerits",
- "ropey",
+ "mamre-rope",
  "rustybuzz",
  "unicode-linebreak",
  "unicode-segmentation",
@@ -52,13 +58,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
-name = "ropey"
-version = "1.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93411e420bcd1a75ddd1dc3caf18c23155eda2c090631a85af21ba19e97093b5"
+name = "mamre"
+version = "0.1.0"
+source = "git+https://github.com/dismalnitch/mamre?rev=1ab8fa9#1ab8fa94f06837b519d708871809945acac38df2"
 dependencies = [
- "smallvec",
- "str_indices",
+ "arrayvec",
+]
+
+[[package]]
+name = "mamre-rope"
+version = "0.1.0"
+source = "git+https://github.com/dismalnitch/mamre?rev=1ab8fa9#1ab8fa94f06837b519d708871809945acac38df2"
+dependencies = [
+ "arrayvec",
+ "mamre",
 ]
 
 [[package]]
@@ -84,12 +97,6 @@ name = "smallvec"
 version = "1.16.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
-
-[[package]]
-name = "str_indices"
-version = "0.4.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d08889ec5408683408db66ad89e0e1f93dff55c73a4ccc71c427d5b277ee47e6"
 
 [[package]]
 name = "ttf-parser"

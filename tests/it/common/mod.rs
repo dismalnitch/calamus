@@ -12,7 +12,7 @@ pub fn buf(text: &str) -> Buffer {
 /// Asserts the buffer contains exactly `expected`, no more and no less.
 #[track_caller]
 pub fn assert_text(b: &Buffer, expected: &str) {
-    let n = expected.chars().count();
+    let n = expected.len();
     let actual = b.read(0, n).map(|s| s.text.to_string());
     assert_eq!(actual.as_deref(), Ok(expected), "buffer prefix mismatch");
     assert!(b.read(0, n + 1).is_err(), "buffer is longer than {expected:?}");

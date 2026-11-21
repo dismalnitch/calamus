@@ -12,9 +12,24 @@ mod insert {
     }
 
     #[test]
-    fn counts_chars_not_bytes() {
+    fn counts_bytes_not_chars() {
         let mut b = Buffer::new();
-        assert_eq!(b.insert(0, "héllo 👍"), Ok(7));
+        assert_eq!(b.insert(0, "héllo 👍"), Ok(11));
+    }
+
+    #[test]
+    fn inside_a_char_errors_and_leaves_buffer_alone() {
+        let mut b = buf("é👍");
+        assert_eq!(b.insert(1, "x"), Err(BufferError::NotCharBoundary { at: 1 }));
+        assert_eq!(b.insert(4, "x"), Err(BufferError::NotCharBoundary { at: 4 }));
+        assert_text(&b, "é👍");
+    }
+
+    #[test]
+    fn between_multibyte_chars() {
+        let mut b = buf("é👍");
+        assert_eq!(b.insert(2, "x"), Ok(1));
+        assert_text(&b, "éx👍");
     }
 
     #[test]
@@ -39,7 +54,7 @@ mod read {
     fn middle() {
         let b = buf("hello world");
         let s = b.read(6, 5).unwrap();
-        assert_eq!(s.text, "world");
+        assert_eq!(s.text.to_string(), "world");
         assert_eq!(s.len(), 5);
     }
 
@@ -56,6 +71,14 @@ mod read {
             b.read(2, 5).err(),
             Some(BufferError::RangeOutOfBounds { at: 2, end: 7, len: 3 })
         );
+    }
+
+    #[test]
+    fn inside_a_char_errors() {
+        let b = buf("aé✓");
+        assert_eq!(b.read(2, 1).err(), Some(BufferError::NotCharBoundary { at: 2 }));
+        assert_eq!(b.read(1, 3).err(), Some(BufferError::NotCharBoundary { at: 4 }));
+        assert_eq!(b.read(1, 2).unwrap().text.to_string(), "é");
     }
 
     #[test]
@@ -78,7 +101,7 @@ mod replace {
     #[test]
     fn middle() {
         let mut b = buf("hello");
-        assert_eq!(b.replace((1..4).into(), "EY👍"), Ok(3));
+        assert_eq!(b.replace((1..4).into(), "EY👍"), Ok(6));
         assert_text(&b, "hEY👍o");
     }
 
@@ -104,6 +127,22 @@ mod replace {
             Err(BufferError::RangeOutOfBounds { at: 1, end: 9, len: 3 })
         );
         assert_text(&b, "abc");
+    }
+
+    #[test]
+    fn inside_a_char_errors_and_leaves_buffer_alone() {
+        let mut b = buf("a👍b");
+        assert_eq!(
+            b.replace((0..2).into(), "x"),
+            Err(BufferError::NotCharBoundary { at: 2 })
+        );
+        assert_eq!(
+            b.replace((3..5).into(), "x"),
+            Err(BufferError::NotCharBoundary { at: 3 })
+        );
+        assert_text(&b, "a👍b");
+        assert_eq!(b.replace((1..5).into(), "é"), Ok(2));
+        assert_text(&b, "aéb");
     }
 
     #[test]
