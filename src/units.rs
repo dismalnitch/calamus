@@ -9,5 +9,5 @@ pub enum Heading {
 
 pub struct Offset {
     pub offset: usize,
-    pub due: Heading,
+    pub heading: Heading,
 }

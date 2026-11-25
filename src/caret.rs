@@ -119,17 +119,23 @@
 //! width.
 //!
 
+use std::fmt::Result;
+
+use crate::Buffer;
+use crate::buffer::Slice;
 use crate::units::{Heading, Offset};
+use unicode_segmentation::GraphemeIncomplete::{InvalidOffset, NextChunk, PreContext, PrevChunk};
+use unicode_segmentation::{GraphemeCursor, Graphemes};
 
 pub enum Affinity {
     Upstream,
     Downstream,
 }
 
-pub struct Caret {
+pub struct Caret<'a, Buffer> {
     pub position: Offset,
     pub affinity: Affinity,
-    text: &str,
+    text: &'a Buffer,
 }
 
 // impl Default for Caret {
@@ -144,19 +150,33 @@ pub struct Caret {
 //         }
 //     }
 // }
-use unicode_segmentation::UnicodeSegmentation;
 
-impl Caret {
-    // TODO: add options
-    pub fn new(text: &str) -> Self {
+impl<'a> Caret<'a, Buffer> {
+    pub fn new(text: &'a Buffer) -> Self {
         Self {
             position: Offset {
                 offset: 0,
-                due: Heading::East,
+                heading: Heading::East,
             },
             affinity: Affinity::Downstream,
             text,
         }
+    }
+
+    pub fn mv_right(&mut self, offset: usize) -> bool {
+        let Some(position) = self.text.next_grapheme_boundary(offset) else {
+            return false;
+        };
+        self.position = position;
+        true
+    }
+
+    pub fn mv_left(&mut self, offset: usize) -> bool {
+        let Some(position) = self.text.prev_grapheme_boundary(offset) else {
+            return false;
+        };
+        self.position = position;
+        true
     }
 
     // interface:
@@ -169,12 +189,12 @@ impl Caret {
     // which rectangles cover this selection? (boxes and spaces)
     // what place is one line above this location? below?
 
-    pub fn position(&self) {
-        if self.position.offset >= self.text.len() {
-            panic!("at the disco")
-        }
-        let g = self.text.grapheme_indices(true);
-        // self.text[self.position.offset]
-        todo!();
-    }
+    // pub fn position(&self) {
+    //     if self.position.offset >= self.text.len() {
+    //         panic!("at the disco")
+    //     }
+    //     let g = self.text.grapheme_indices(true);
+    //     // self.text[self.position.offset]
+    //     todo!();
+    // }
 }

@@ -7,8 +7,10 @@ use std::{fmt, range::Range};
 
 use mamre_rope::Rope;
 
+use crate::units::{Heading, Offset};
+
 pub struct Buffer {
-    buffer: Rope,
+    rope: Rope,
 }
 
 /// A view into the buffer: a rope of its own that shares the buffer's
@@ -45,7 +47,10 @@ impl fmt::Display for BufferError {
                 write!(f, "byte {at} out of bounds for buffer of {len} bytes")
             }
             BufferError::RangeOutOfBounds { at, end, len } => {
-                write!(f, "range {at}..{end} out of bounds for buffer of {len} bytes")
+                write!(
+                    f,
+                    "range {at}..{end} out of bounds for buffer of {len} bytes"
+                )
             }
             BufferError::NotCharBoundary { at } => {
                 write!(f, "byte {at} is not a char boundary")
@@ -64,18 +69,38 @@ impl Default for Buffer {
 
 impl Buffer {
     pub fn new() -> Self {
-        Self {
-            buffer: Rope::new(),
-        }
+        Self { rope: Rope::new() }
     }
 
     /// Length in bytes.
     pub fn len(&self) -> usize {
-        self.buffer.len()
+        self.rope.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.buffer.is_empty()
+        self.rope.is_empty()
+    }
+
+    pub fn prev_grapheme_boundary(&self, offset: usize) -> Option<Offset> {
+        let position: Option<usize> = self.rope.prev_grapheme_boundary(offset);
+        {
+            let position = position?;
+            Some(Offset {
+                offset: position,
+                heading: Heading::East,
+            })
+        }
+    }
+
+    pub fn next_grapheme_boundary(&self, offset: usize) -> Option<Offset> {
+        let position: Option<usize> = self.rope.next_grapheme_boundary(offset);
+        {
+            let position = position?;
+            Some(Offset {
+                offset: position,
+                heading: Heading::East,
+            })
+        }
     }
 
     /// Replaces the bytes in `range` with `text`. Returns the number of
@@ -91,7 +116,7 @@ impl Buffer {
         }
         self.check_boundary(range.start)?;
         self.check_boundary(range.end)?;
-        self.buffer.replace(range.start..range.end, text);
+        self.rope.replace(range.start..range.end, text);
         Ok(text.len())
     }
 
@@ -102,7 +127,7 @@ impl Buffer {
             return Err(BufferError::OutOfBounds { at, len });
         }
         self.check_boundary(at)?;
-        self.buffer.insert(at, text);
+        self.rope.insert(at, text);
         Ok(text.len())
     }
 
@@ -120,7 +145,7 @@ impl Buffer {
         self.check_boundary(at)?;
         self.check_boundary(end)?;
         Ok(Slice {
-            text: self.buffer.slice(at..end),
+            text: self.rope.slice(at..end),
         })
     }
 
@@ -142,17 +167,17 @@ impl Buffer {
     /// char offsets, each found in O(log n), for one landing on `at`. Swap
     /// for the rope's own O(log n) check once it's public.
     fn is_char_boundary(&self, at: usize) -> bool {
-        let (mut lo, mut hi) = (0, self.buffer.summary().chars);
+        let (mut lo, mut hi) = (0, self.rope.summary().chars);
         // The first char whose offset is at or past `at`.
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if self.buffer.char_to_offset(mid) < at {
+            if self.rope.char_to_offset(mid) < at {
                 lo = mid + 1;
             } else {
                 hi = mid;
             }
         }
-        self.buffer.char_to_offset(lo) == at
+        self.rope.char_to_offset(lo) == at
     }
 }
 
@@ -219,7 +244,11 @@ mod tests {
         let mut b = Buffer::new();
         b.insert(0, &text).unwrap();
         for at in 0..=text.len() {
-            assert_eq!(b.is_char_boundary(at), text.is_char_boundary(at), "byte {at}");
+            assert_eq!(
+                b.is_char_boundary(at),
+                text.is_char_boundary(at),
+                "byte {at}"
+            );
         }
     }
 }
