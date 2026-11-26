@@ -4,6 +4,7 @@
 
 mod fetched;
 
+mod bidi;
 mod fallback;
 mod language;
 mod missing;

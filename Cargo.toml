@@ -8,6 +8,7 @@ demerits = { git = "https://github.com/Ganderworks/demerits", rev = "d555ac9", v
 mamre-rope = { git = "https://github.com/dismalnitch/mamre", rev = "3cd0593", version = "0.1.0" }
 mamre-text = { git = "https://github.com/dismalnitch/mamre", rev = "3cd0593", version = "0.1.0" }
 rustybuzz = "0.20.1"
+unicode-bidi = "0.3.18"
 unicode-linebreak = "0.1.5"
 unicode-segmentation = "1.13.3"
 

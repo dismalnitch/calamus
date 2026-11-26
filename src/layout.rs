@@ -56,8 +56,9 @@
 //! # Not yet
 //!
 //! Every run sits on the line's baseline: no superscripts or other
-//! `vertical-align`. Left to right only: no bidi, so Hebrew
-//! comes out in logical order. No hyphenation inside words: lines break at
+//! `vertical-align`. Text runs right to left only where it's told to
+//! ([`set_paragraph_bidi`]): which text does is decided elsewhere
+//! ([`bidi`](crate::bidi)). No hyphenation inside words: lines break at
 //! spaces, after hyphens and wherever else UAX #14 allows. Each stretch of
 //! text between breaks is shaped on its own, so nothing kerns across a space
 //! or a break.
@@ -286,7 +287,8 @@ pub struct Line {
     /// demerits' adjustment ratio for the line: how far its spaces stretch
     /// (above 0) or shrink (below 0). Always `0.0` when ragged.
     pub ratio: f64,
-    /// The glyphs to draw, in order.
+    /// The glyphs to draw, from left to right: where text runs right to
+    /// left, that's the reverse of its order in the text.
     pub glyphs: Vec<Glyph>,
 }
 
@@ -310,6 +312,12 @@ pub struct Glyph {
     /// [`font`](TextStyle::font), 1 the first of its
     /// [`fallback`](TextStyle::fallback), and so on.
     pub font: usize,
+    /// How far the pen moves on past it: its width on the line. A mark set
+    /// on a letter has none.
+    pub advance: i64,
+    /// Its text's level: even runs left to right, odd right to left. Always
+    /// 0 from [`set_paragraph`].
+    pub level: u8,
 }
 
 /// Set `text` as one paragraph, each of its `runs` in its own style. Line
@@ -328,6 +336,33 @@ pub struct Glyph {
 /// If `line_widths` is empty, if the runs don't add up to the text, or if
 /// one ends inside a character.
 pub fn set_paragraph(text: &str, runs: &[Run], style: &Style, line_widths: &[i64]) -> Paragraph {
+    set_paragraph_bidi(text, runs, style, line_widths, 0, &[])
+}
+
+/// [`set_paragraph`], for text that doesn't all run left to right.
+/// `levels` is each byte's level, as Unicode's bidirectional algorithm
+/// has them (see [`bidi::levels`](crate::bidi::levels)): even runs left to
+/// right, odd right to left. `base` is the paragraph's own. Empty `levels`
+/// is every byte at `base`.
+///
+/// Each stretch at one level is shaped in its direction, and each line's
+/// stretches are put in the order they're read on the page (the
+/// algorithm's rule L2). A paragraph that runs right to left and isn't
+/// justified is set against the right edge.
+///
+/// # Panics
+///
+/// As [`set_paragraph`], and if `levels` is neither empty nor as long as
+/// the text.
+pub fn set_paragraph_bidi(
+    text: &str,
+    runs: &[Run],
+    style: &Style,
+    line_widths: &[i64],
+    base: u8,
+    levels: &[u8],
+) -> Paragraph {
+    assert!(levels.is_empty() || levels.len() == text.len(), "a level for every byte, or none");
     assert!(!line_widths.is_empty(), "no line widths: every line needs one");
     let mut ends = Vec::with_capacity(runs.len());
     let mut end = 0usize;
@@ -341,7 +376,7 @@ pub fn set_paragraph(text: &str, runs: &[Run], style: &Style, line_widths: &[i64
     }
     assert!(end == text.len(), "the runs hold {end} of the text's {} bytes", text.len());
 
-    let (items, spans, glyphs) = itemize(text, runs, &ends);
+    let (items, spans, glyphs, parts) = itemize(text, runs, &ends, base, levels);
     let breaks = match style.align {
         Align::Ragged => demerits::ragged(&items, line_widths),
         Align::Justified => match demerits::break_lines(&items, line_widths, &demerits::Params::default()) {
@@ -350,7 +385,7 @@ pub fn set_paragraph(text: &str, runs: &[Run], style: &Style, line_widths: &[i64
         },
     }
     .expect("itemize always ends the paragraph with a forced break");
-    let lines = set_lines(&items, &spans, &glyphs, &breaks, runs, style, line_widths);
+    let lines = set_lines(&items, &spans, &glyphs, &parts, &breaks, runs, style, line_widths, base);
     let height = lines.last().map_or(0, |l| l.top + l.height);
     Paragraph { lines, height }
 }
@@ -365,6 +400,7 @@ struct Shaped {
     advance: i64,
     x_offset: i64,
     y_offset: i64,
+    level: u8,
 }
 
 /// Shapes a paragraph one run at a time: each stretch of text between two
@@ -382,6 +418,13 @@ struct Shaper<'a> {
     faces: Vec<Faced<'a>>,
     buffer: Option<UnicodeBuffer>,
     glyphs: Vec<Shaped>,
+    /// The paragraph's level, and each byte's (none: all the paragraph's).
+    base: u8,
+    levels: &'a [u8],
+    /// Where each stretch shaped as one ends among the glyphs. Inside one,
+    /// the glyphs are in the order they're drawn, left to right; a line
+    /// puts whole stretches in order.
+    parts: Vec<usize>,
 }
 
 /// A font in use, parsed once, with its plans. Building a plan is slow, so
@@ -389,12 +432,16 @@ struct Shaper<'a> {
 struct Faced<'a> {
     font: &'a Font,
     face: rustybuzz::Face<'a>,
-    plans: Vec<(Script, Option<Language>, ShapePlan)>,
+    plans: Vec<(Script, Option<Language>, Direction, ShapePlan)>,
 }
 
 impl<'a> Shaper<'a> {
-    fn new(runs: &'a [Run<'a>], ends: &'a [usize]) -> Self {
-        Shaper { runs, ends, faces: Vec::new(), buffer: None, glyphs: Vec::new() }
+    fn new(runs: &'a [Run<'a>], ends: &'a [usize], base: u8, levels: &'a [u8]) -> Self {
+        Shaper { runs, ends, faces: Vec::new(), buffer: None, glyphs: Vec::new(), base, levels, parts: Vec::new() }
+    }
+
+    fn level(&self, at: usize) -> u8 {
+        self.levels.get(at).copied().unwrap_or(self.base)
     }
 
     /// Shape `text[range]`, run by run, and return the range of its glyphs.
@@ -408,8 +455,13 @@ impl<'a> Shaper<'a> {
                 break;
             }
             let piece = run_start.max(range.start)..self.ends[r].min(range.end);
-            if !piece.is_empty() {
-                self.shape_piece(text, piece, r);
+            // Each stretch at one level on its own, in its direction.
+            let mut start = piece.start;
+            while start < piece.end {
+                let level = self.level(start);
+                let end = (start..piece.end).find(|&at| self.level(at) != level).unwrap_or(piece.end);
+                self.shape_piece(text, start..end, r);
+                start = end;
             }
             r += 1;
         }
@@ -499,7 +551,9 @@ impl<'a> Shaper<'a> {
             advance: font.scale(i32::from(advance), size),
             x_offset: 0,
             y_offset: 0,
+            level: self.level(at),
         });
+        self.parts.push(self.glyphs.len());
     }
 
     /// Shape `text[piece]` in run `r`'s font `font_index`.
@@ -512,21 +566,23 @@ impl<'a> Shaper<'a> {
         buffer.push_str(&text[piece.clone()]);
         buffer.set_pre_context(&text[..piece.start]);
         buffer.set_post_context(&text[piece.end..]);
-        // No bidi yet: everything is set left to right, in logical order, so
-        // glyphs come out in the order of their clusters.
-        buffer.set_direction(Direction::LeftToRight);
+        // Set right to left, the glyphs come out as they're drawn, from
+        // the left: last cluster first.
+        let level = self.level(piece.start);
+        let direction = if level % 2 == 1 { Direction::RightToLeft } else { Direction::LeftToRight };
+        buffer.set_direction(direction);
         if let Some(language) = &language {
             buffer.set_language(language.clone());
         }
         buffer.guess_segment_properties();
         let script = buffer.script();
         let Faced { face, plans, .. } = &mut self.faces[f];
-        let plan = match plans.iter().position(|(s, l, _)| *s == script && *l == language) {
-            Some(i) => &plans[i].2,
+        let plan = match plans.iter().position(|(s, l, d, _)| *s == script && *l == language && *d == direction) {
+            Some(i) => &plans[i].3,
             None => {
-                let plan = ShapePlan::new(face, Direction::LeftToRight, Some(script), language.as_ref(), &[]);
-                plans.push((script, language, plan));
-                &plans.last().expect("just pushed").2
+                let plan = ShapePlan::new(face, direction, Some(script), language.as_ref(), &[]);
+                plans.push((script, language, direction, plan));
+                &plans.last().expect("just pushed").3
             }
         };
         let shaped = rustybuzz::shape_with_plan(face, plan, buffer);
@@ -539,8 +595,10 @@ impl<'a> Shaper<'a> {
                 advance: font.scale(pos.x_advance, size),
                 x_offset: font.scale(pos.x_offset, size),
                 y_offset: font.scale(pos.y_offset, size),
+                level,
             }
         }));
+        self.parts.push(self.glyphs.len());
         self.buffer = Some(shaped.clear());
     }
 }
@@ -598,8 +656,14 @@ fn is_line_end(c: char) -> bool {
 }
 
 /// Turn the text into items, shaping it as it goes.
-fn itemize(text: &str, runs: &[Run], ends: &[usize]) -> (Vec<Item>, Vec<Span>, Vec<Shaped>) {
-    let mut shaper = Shaper::new(runs, ends);
+fn itemize(
+    text: &str,
+    runs: &[Run],
+    ends: &[usize],
+    base: u8,
+    levels: &[u8],
+) -> (Vec<Item>, Vec<Span>, Vec<Shaped>, Vec<usize>) {
+    let mut shaper = Shaper::new(runs, ends, base, levels);
     let mut items = Vec::new();
     let mut spans = Vec::new();
     let mut push = |item: Item, glyphs: Range<usize>, end: usize| {
@@ -615,7 +679,7 @@ fn itemize(text: &str, runs: &[Run], ends: &[usize]) -> (Vec<Item>, Vec<Span>, V
     if text.is_empty() {
         // An empty paragraph is one empty line.
         end_of_paragraph(&mut push, 0, 0);
-        return (items, spans, shaper.glyphs);
+        return (items, spans, shaper.glyphs, shaper.parts);
     }
     let mut start = 0;
     for (end, opportunity) in linebreaks(text) {
@@ -652,17 +716,57 @@ fn itemize(text: &str, runs: &[Run], ends: &[usize]) -> (Vec<Item>, Vec<Span>, V
         }
         start = end;
     }
-    (items, spans, shaper.glyphs)
+    (items, spans, shaper.glyphs, shaper.parts)
 }
 
+/// A stretch of a line's glyphs that stays together, in the order they're
+/// drawn: what was shaped as one, or part of it.
+struct Part {
+    glyphs: Range<usize>,
+    level: u8,
+    /// Room after it that's no glyph's: what a space was stretched by, or
+    /// shrunk (then it's less than nothing).
+    pad: i64,
+}
+
+/// The order to draw `parts` in, from the left: Unicode's rule L2. From
+/// the highest level down to the lowest odd one, every run of parts at
+/// that level or higher is turned round.
+fn drawn_order(parts: &[Part], base: u8) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..parts.len()).collect();
+    let highest = parts.iter().map(|p| p.level).max().unwrap_or(base).max(base);
+    let lowest_odd = parts.iter().map(|p| p.level).chain([base]).filter(|l| l % 2 == 1).min();
+    let Some(lowest_odd) = lowest_odd else {
+        return order;
+    };
+    for level in (lowest_odd..=highest).rev() {
+        let mut i = 0;
+        while i < order.len() {
+            if parts[order[i]].level < level {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < order.len() && parts[order[i]].level >= level {
+                i += 1;
+            }
+            order[start..i].reverse();
+        }
+    }
+    order
+}
+
+#[allow(clippy::too_many_arguments)]
 fn set_lines(
     items: &[Item],
     spans: &[Span],
     glyphs: &[Shaped],
+    shaped_parts: &[usize],
     breaks: &[demerits::Break],
     runs: &[Run],
     style: &Style,
     line_widths: &[i64],
+    base: u8,
 ) -> Vec<Line> {
     let strut = style.strut.extent();
     // The room each run asks for, in each of its fonts.
@@ -712,23 +816,18 @@ fn set_lines(
             (0, 0)
         };
 
-        let mut placed = Vec::new();
-        let mut pen = 0;
-        let (mut above, mut below) = strut;
-        let mut place = |placed: &mut Vec<Glyph>, pen: &mut i64, glyphs: &[Shaped]| {
-            for g in glyphs {
-                placed.push(Glyph {
-                    id: g.id,
-                    x: *pen + g.x_offset,
-                    y: -g.y_offset,
-                    cluster: g.cluster,
-                    run: g.run,
-                    font: g.font,
-                });
-                *pen += g.advance;
-                let (a, b) = extents[g.run][g.font];
-                above = above.max(a);
-                below = below.max(b);
+        // The line's parts, in the text's order: each stretch shaped as
+        // one, with what its space gives or takes after it.
+        let mut parts: Vec<Part> = Vec::new();
+        let split = |parts: &mut Vec<Part>, range: &Range<usize>| {
+            let mut from = range.start;
+            // The first shaped stretch that ends after `from`.
+            let mut k = shaped_parts.partition_point(|&end| end <= from);
+            while from < range.end {
+                let to = shaped_parts.get(k).copied().unwrap_or(range.end).min(range.end);
+                parts.push(Part { glyphs: from..to, level: glyphs[from].level, pad: 0 });
+                from = to;
+                k += 1;
             }
         };
         // The running share of each glue in `adjust`: glue j ends up
@@ -737,10 +836,10 @@ fn set_lines(
         let (mut shares, mut given) = (0i64, 0i64);
         for (item, span) in items[s..at].iter().zip(&spans[s..at]) {
             match *item {
-                Item::Box { .. } => place(&mut placed, &mut pen, &glyphs[span.glyphs.clone()]),
+                Item::Box { .. } => split(&mut parts, &span.glyphs),
                 Item::Glue { width: natural_width, stretch: y, shrink: z } => {
-                    let glue_start = pen;
-                    place(&mut placed, &mut pen, &glyphs[span.glyphs.clone()]);
+                    let before = parts.len();
+                    split(&mut parts, &span.glyphs);
                     let share = match (adjust > 0, y) {
                         (true, Stretch::Finite(y)) => y,
                         (true, Stretch::Infinite) => 0,
@@ -753,13 +852,51 @@ fn set_lines(
                         moved = target - given;
                         given = target;
                     }
-                    pen = glue_start + natural_width + moved;
+                    // The glue is as wide as its natural width and its
+                    // share, whatever its glyphs came to.
+                    let drawn: i64 = glyphs[span.glyphs.clone()].iter().map(|g| g.advance).sum();
+                    let pad = natural_width + moved - drawn;
+                    if parts.len() > before {
+                        parts.last_mut().expect("just pushed").pad = pad;
+                    } else if let Some(last) = parts.last_mut() {
+                        last.pad += pad;
+                    }
                 }
                 Item::Penalty { .. } => {}
             }
         }
+
+        let mut placed = Vec::new();
+        let mut pen = 0;
+        let (mut above, mut below) = strut;
+        for i in drawn_order(&parts, base) {
+            let part = &parts[i];
+            for g in &glyphs[part.glyphs.clone()] {
+                placed.push(Glyph {
+                    id: g.id,
+                    x: pen + g.x_offset,
+                    y: -g.y_offset,
+                    cluster: g.cluster,
+                    run: g.run,
+                    font: g.font,
+                    advance: g.advance,
+                    level: g.level,
+                });
+                pen += g.advance;
+                let (a, b) = extents[g.run][g.font];
+                above = above.max(a);
+                below = below.max(b);
+            }
+            pen += part.pad;
+        }
         if let Item::Penalty { width, .. } = items[at] {
             pen += width;
+        }
+        // A paragraph that runs right to left starts at the right edge.
+        if base % 2 == 1 && style.align == Align::Ragged && pen < width {
+            for g in &mut placed {
+                g.x += width - pen;
+            }
         }
 
         let end = spans[at].end;

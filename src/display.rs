@@ -21,8 +21,12 @@
 //!   which. Only line breaks make them so far; the lookups already take
 //!   two stops for one offset on the same line, which is what a change of
 //!   direction will make.
-//! - Left to right only, as the typesetter is: stops assume x grows with
-//!   the offset.
+//! - Text runs both ways. A paragraph's stretches that run against it are
+//!   the buffer's isolates, handed in with the text; inside them
+//!   Unicode's bidirectional algorithm decides ([`bidi`]).
+//!   Stops are kept in the text's order and, beside that, in the order
+//!   they are on the page ([`Line::visual`]). Where the direction
+//!   changes, an offset is two stops.
 //! - The whole text is set again on every change, paragraph by paragraph.
 //!   No cache, no incremental layout.
 //! - One font and its fallbacks, ragged, no styles.
@@ -36,7 +40,9 @@ use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
 
 pub use crate::caret::Affinity;
-use crate::layout::{Align, Font, Glyph, Run, Style, TextStyle, is_space, set_paragraph};
+use crate::bidi::{self, Stretch};
+use crate::buffer::Isolate;
+use crate::layout::{Align, Font, Glyph, Run, Style, TextStyle, is_space, set_paragraph, set_paragraph_bidi};
 
 /// A rectangle in scaled points, from the top-left of the text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,8 +103,18 @@ pub struct Line {
     /// spaces take no room, so the place after them is the next line's
     /// start only.
     pub stops: Vec<Stop>,
-    /// The glyphs to draw: `x` from the line's start, `y` down from the
-    /// baseline, `cluster` a byte offset into the whole text.
+    /// The line's stops in the order they are on the page, from the left:
+    /// indices into `stops`. Where text runs right to left, that's the
+    /// reverse of the text's order. Two stops at one x are in the order
+    /// of the text either side of them: the one that's the end of what's
+    /// on the left first.
+    pub visual: Vec<usize>,
+    /// Whether the line's paragraph runs right to left: it starts at the
+    /// right edge, and its next line is reached off its left end.
+    pub rtl: bool,
+    /// The glyphs to draw, from the left: `x` from the line's start, `y`
+    /// down from the baseline, `cluster` a byte offset into the whole
+    /// text.
     pub glyphs: Vec<Glyph>,
 }
 
@@ -193,11 +209,38 @@ impl Display {
     }
 
     /// Set `text` again `width` scaled points wide.
-    pub fn set_width(&mut self, width: i64, text: &str) {
+    pub fn set_width(&mut self, width: i64, text: &str, isolates: &[Isolate]) {
         if width != self.width {
             self.width = width;
-            self.set(text);
+            self.set(text, isolates);
         }
+    }
+
+    /// The place next to `at` on the page, to its right or its left:
+    /// what an arrow key moves to. Off a line's end, it's the line after
+    /// or before, as the paragraph reads. `None` past the text's ends.
+    ///
+    /// Where text changes direction, two places share an x: the end of
+    /// what's on one side and the edge of what's on the other. A step
+    /// from one to the other moves nothing on the page, and changes
+    /// which text the cursor is with.
+    pub fn place_beside(&self, at: Place, right: bool) -> Option<Place> {
+        let here = self.stop_index(at);
+        let line = &self.lines[here.line];
+        let v = line.visual.iter().position(|&s| s == here.stop)?;
+        let beside = if right { v + 1 } else { v.wrapping_sub(1) };
+        if let Some(&stop) = line.visual.get(beside) {
+            return self.place(StopIndex::new(here.line, stop));
+        }
+        // Off the end: on to the next line if that's the way the
+        // paragraph reads, else back to the one before; and onto the end
+        // of it that's met first.
+        let onward = right != line.rtl;
+        let to = if onward { here.line + 1 } else { here.line.checked_sub(1)? };
+        let next = self.lines.get(to)?;
+        let first = onward != next.rtl;
+        let stop = if first { next.visual.first() } else { next.visual.last() };
+        self.place(StopIndex::new(to, *stop?))
     }
 
     /// Where `at`'s stop is: on its line, its own stop, or the last stop
@@ -266,34 +309,58 @@ impl Display {
         self.nearest_place(i, x)
     }
 
-    /// The rectangles covering `range`, one per line it touches. A line the
-    /// selection runs on past reaches the display's right edge. The range
-    /// starts at its first offset's downstream place and ends at its last
-    /// one's upstream place: a selection up to a line's end stays on that
-    /// line.
+    /// The rectangles covering `range`: one per line it touches where the
+    /// text runs one way, more where a line's selected text isn't side by
+    /// side on the page. A line the selection runs on past reaches the
+    /// display's edge. The range starts at its first offset's downstream
+    /// place and ends at its last one's upstream place: a selection up to
+    /// a line's end stays on that line.
     pub fn selection_rects(&self, range: Range<usize>) -> Vec<Rect> {
         let (a, b) = (range.start.min(range.end), range.start.max(range.end));
-        let a = Place::downstream(a);
-        let b = if a.offset == b { a } else { Place::upstream(b) };
-        let (first, last) = (self.line_of(a), self.line_of(b));
-        (first..=last)
-            .filter_map(|i| {
-                let line = &self.lines[i];
-                let x0 = if i == first { self.x_of(a) } else { 0 };
-                let x1 = if i == last { self.x_of(b) } else { self.width };
-                (x1 > x0 || a == b).then_some(Rect {
-                    x: x0,
-                    y: line.top,
-                    width: x1 - x0,
-                    height: line.height,
-                })
-            })
-            .collect()
+        if a == b {
+            return vec![self.caret_rect(Place::downstream(a))];
+        }
+        let first = self.line_of(Place::downstream(a));
+        let last = self.line_of(Place::upstream(b));
+        let mut rects = Vec::new();
+        for i in first..=last {
+            let line = &self.lines[i];
+            // Between one stop and the next in the text is a cluster's
+            // room on the page; between two stops at one offset is
+            // nothing.
+            let mut spans: Vec<(i64, i64)> = line
+                .stops
+                .windows(2)
+                .filter(|w| w[0].offset < w[1].offset && a <= w[0].offset && w[1].offset <= b)
+                .map(|w| (w[0].x.min(w[1].x), w[0].x.max(w[1].x)))
+                .collect();
+            if i < last {
+                // It runs on: out to the edge the paragraph reads toward.
+                let (lo, hi) = extent(line);
+                spans.push(if line.rtl { (0, lo) } else { (hi, self.width.max(hi)) });
+            }
+            spans.sort_unstable();
+            let mut joined: Vec<(i64, i64)> = Vec::new();
+            for (lo, hi) in spans {
+                match joined.last_mut() {
+                    Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+                    _ => joined.push((lo, hi)),
+                }
+            }
+            rects.extend(joined.into_iter().filter(|(lo, hi)| hi > lo).map(|(lo, hi)| Rect {
+                x: lo,
+                y: line.top,
+                width: hi - lo,
+                height: line.height,
+            }));
+        }
+        rects
     }
 
     /// Set the whole of `text` (line ends `\n` only), paragraph by
-    /// paragraph.
-    pub fn set(&mut self, text: &str) {
+    /// paragraph, with its `isolates`: the stretches the buffer keeps as
+    /// set in a direction of their own.
+    pub fn set(&mut self, text: &str, isolates: &[Isolate]) {
         let fallback: Vec<&Font> = self.fallback.iter().map(|f| f.as_ref()).collect();
         let style = TextStyle {
             font: &self.font,
@@ -328,11 +395,22 @@ impl Display {
                 .map(|(i, _)| i)
                 .chain(std::iter::once(text.len()))
                 .collect();
+            // The paragraph's isolates, in its own bytes.
+            let within: Vec<Stretch> = isolates
+                .iter()
+                .filter(|i| start <= i.range.start && i.range.end <= start + text.len())
+                .map(|i| Stretch {
+                    range: i.range.start - start..i.range.end - start,
+                    direction: i.direction,
+                })
+                .collect();
+            let base = bidi::base(text);
+            let levels = bidi::levels(text, &within);
             let runs = [Run {
                 len: text.len(),
                 style,
             }];
-            let set = set_paragraph(text, &runs, &paragraph_style, &[self.width]);
+            let set = set_paragraph_bidi(text, &runs, &paragraph_style, &[self.width], base, &levels);
             let count = set.lines.len();
             for (i, line) in set.lines.iter().enumerate() {
                 let last = i + 1 == count;
@@ -348,33 +426,30 @@ impl Display {
                             && (b < line.text.end || (ends_here && b == line.text.end))
                     })
                     .collect();
-                let mut xs = stop_xs(&on_line, &line.glyphs, line.width);
-                if last {
-                    // The typesetter gives the spaces before a paragraph's
-                    // end no room, so every stop among them would sit at
-                    // the line's end: a space typed there, or deleted,
-                    // wouldn't move the cursor. Step past each one.
-                    let trimmed = text.trim_end_matches(' ').len();
-                    for (&b, x) in on_line.iter().zip(xs.iter_mut()) {
-                        if b > trimmed {
-                            *x = line.width + (b - trimmed) as i64 * space;
-                        }
-                    }
-                }
+                // Where what's drawn ends: the spaces after it have no
+                // glyphs.
+                let drawn = line.text.start + text[line.text.start..line.text.end].trim_end_matches(is_space).len();
+                // At a paragraph's end, the typesetter gives those spaces
+                // no room either, so every stop among them would sit on
+                // the text's end: a space typed there, or deleted,
+                // wouldn't move the cursor. Step past each one.
+                let step = if last { space } else { 0 };
+                let (stops, visual) = line_stops(&on_line, drawn, &line.glyphs, &levels, base, self.width, step);
                 lines.push(Line {
                     top: top + line.top,
                     height: line.height,
                     baseline: top + line.baseline,
                     width: line.width,
                     start: start + line.text.start,
-                    stops: on_line
-                        .iter()
-                        .zip(xs)
-                        .map(|(&b, x)| Stop {
-                            offset: start + b,
-                            x,
+                    stops: stops
+                        .into_iter()
+                        .map(|s| Stop {
+                            offset: start + s.offset,
+                            x: s.x,
                         })
                         .collect(),
+                    visual,
+                    rtl: base % 2 == 1,
                     glyphs: line
                         .glyphs
                         .iter()
@@ -430,42 +505,137 @@ impl Display {
     }
 }
 
-/// The x of each boundary on a line (byte offsets into the paragraph, in
-/// order): the leftmost glyph whose cluster starts there; boundaries with
-/// none (inside a ligature) evenly between their neighbours; past the last
-/// glyph, the line's width.
-fn stop_xs(boundaries: &[usize], glyphs: &[Glyph], width: i64) -> Vec<i64> {
-    let at = |b: usize| glyphs.iter().filter(|g| g.cluster == b).map(|g| g.x).min();
-    let last_cluster = glyphs.iter().map(|g| g.cluster).max();
-    let mut xs: Vec<Option<i64>> = boundaries
-        .iter()
-        .map(|&b| match last_cluster {
-            Some(c) if b > c => Some(width),
-            None => Some(0),
-            _ => at(b),
-        })
-        .collect();
-    // Fill the gaps between known stops evenly.
+/// How far left and right a line's stops reach.
+fn extent(line: &Line) -> (i64, i64) {
+    let xs = || line.stops.iter().map(|s| s.x);
+    (xs().min().unwrap_or(0), xs().max().unwrap_or(0))
+}
+
+/// A line's caret stops, in the text's order, and the order they're in on
+/// the page.
+///
+/// `boundaries` are the grapheme boundaries on the line (byte offsets into
+/// the paragraph, in order), `drawn` where its glyphs' text ends, and
+/// `levels` each byte's level. Offsets in the stops are the paragraph's.
+///
+/// The line is taken a stretch at a time: the text at one level, which is
+/// side by side on the page. Running left to right, a boundary is at its
+/// cluster's left edge and the stretch ends at its right; running right to
+/// left, at the cluster's right edge, ending at the stretch's left. A
+/// boundary with no glyph of its own (inside a ligature) is shared out
+/// evenly between its neighbours. Where one stretch ends and the next
+/// begins, that offset has both places: two stops, unless they're at the
+/// same x.
+///
+/// Past `drawn` there's nothing drawn: each boundary there steps `step`
+/// further on, the way its level runs.
+fn line_stops(
+    boundaries: &[usize],
+    drawn: usize,
+    glyphs: &[Glyph],
+    levels: &[u8],
+    base: u8,
+    width: i64,
+    step: i64,
+) -> (Vec<Stop>, Vec<usize>) {
+    let level_at = |b: usize| levels.get(b).copied().unwrap_or(base);
+    let mut stops: Vec<Stop> = Vec::new();
+    // For each stop, where its stretch is on the page and which way it
+    // runs: what orders two stops at one x.
+    let mut keys: Vec<(i64, bool)> = Vec::new();
+    let content: Vec<usize> = boundaries.iter().copied().filter(|&b| b <= drawn).collect();
+    let (mut left, mut right) = (i64::MAX, i64::MIN);
     let mut i = 0;
-    while i < xs.len() {
-        if xs[i].is_some() {
-            i += 1;
-            continue;
+    while i + 1 < content.len() {
+        let level = level_at(content[i]);
+        let mut j = i + 1;
+        while j + 1 < content.len() && level_at(content[j]) == level {
+            j += 1;
         }
-        let before = if i > 0 { xs[i - 1].unwrap_or(0) } else { 0 };
-        let j = (i..xs.len()).find(|&j| xs[j].is_some()).unwrap_or(xs.len());
-        let after = if j < xs.len() {
-            xs[j].unwrap_or(width)
-        } else {
-            width
+        let (from, to) = (content[i], content[j]);
+        let rtl = level % 2 == 1;
+        let own = || glyphs.iter().filter(move |g| from <= g.cluster && g.cluster < to);
+        let x0 = own().map(|g| g.x).min();
+        let x1 = own().map(|g| g.x + g.advance).max();
+        let (Some(x0), Some(x1)) = (x0, x1) else {
+            i = j;
+            continue;
         };
-        let gaps = (j - i + 1) as i64;
-        for (k, x) in xs[i..j].iter_mut().enumerate() {
-            *x = Some(before + (after - before) * (k as i64 + 1) / gaps);
+        (left, right) = (left.min(x0), right.max(x1));
+        // Each boundary's x where a glyph says: its cluster's near edge.
+        let mut xs: Vec<Option<i64>> = content[i..=j]
+            .iter()
+            .map(|&b| {
+                let at = glyphs.iter().filter(|g| g.cluster == b);
+                if rtl { at.map(|g| g.x + g.advance).max() } else { at.map(|g| g.x).min() }
+            })
+            .collect();
+        xs[0] = Some(if rtl { x1 } else { x0 });
+        *xs.last_mut().expect("two at least") = Some(if rtl { x0 } else { x1 });
+        // The rest evenly between the ones either side.
+        let mut k = 0;
+        while k < xs.len() {
+            if xs[k].is_some() {
+                k += 1;
+                continue;
+            }
+            let before = xs[k - 1].expect("filled");
+            let next = (k..xs.len()).find(|&n| xs[n].is_some()).expect("the last is filled");
+            let after = xs[next].expect("found");
+            let gaps = (next - k + 1) as i64;
+            for (n, x) in xs[k..next].iter_mut().enumerate() {
+                *x = Some(before + (after - before) * (n as i64 + 1) / gaps);
+            }
+            k = next;
+        }
+        for (&offset, x) in content[i..=j].iter().zip(xs) {
+            let stop = Stop { offset, x: x.expect("filled") };
+            // The end of the stretch before, at the same place: one stop.
+            if stops.last() != Some(&stop) {
+                stops.push(stop);
+                keys.push((x0, rtl));
+            }
         }
         i = j;
     }
-    xs.into_iter().map(|x| x.unwrap_or(0)).collect()
+    // What isn't drawn: on from where the text before it ends if it runs
+    // the same way, else from the line's edge that way.
+    let tail_level = level_at(drawn.min(levels.len().saturating_sub(1)));
+    let tail_level = if drawn < levels.len() { tail_level } else { base };
+    let rtl = tail_level % 2 == 1;
+    if left > right {
+        // Nothing drawn at all: the line's start.
+        let x = if base % 2 == 1 { width } else { 0 };
+        (left, right) = (x, x);
+    }
+    let follows = keys.last().is_some_and(|&(_, last_rtl)| last_rtl == rtl)
+        && stops.last().is_some_and(|s| s.offset == drawn);
+    let from = match stops.last() {
+        Some(s) if follows => s.x,
+        _ => if rtl { left } else { right },
+    };
+    // The first of them is at `from` unless that's the text's own end.
+    let mut n = i64::from(follows);
+    for &offset in boundaries {
+        if offset < drawn || (offset == drawn && follows) {
+            continue;
+        }
+        let x = if rtl { from - n * step } else { from + n * step };
+        n += 1;
+        let stop = Stop { offset, x };
+        if stops.last() != Some(&stop) {
+            stops.push(stop);
+            keys.push((from.min(x), rtl));
+        }
+    }
+    // On the page: by x; at one x, the stretch further left first; in one
+    // stretch (clusters with no width), the way it runs.
+    let mut visual: Vec<usize> = (0..stops.len()).collect();
+    visual.sort_by_key(|&i| {
+        let (at, rtl) = keys[i];
+        (stops[i].x, at, if rtl { -(i as i64) } else { i as i64 })
+    });
+    (stops, visual)
 }
 
 #[cfg(test)]
@@ -477,7 +647,7 @@ mod tests {
         let inter =
             Font::from_bytes(include_bytes!("../fonts/Inter-Regular.ttf").to_vec()).unwrap();
         let mut d = Display::new(Arc::new(inter), vec![], 17 * PT, 24 * PT, width * PT);
-        d.set(text);
+        d.set(text, &[]);
         d
     }
 
@@ -672,6 +842,154 @@ mod tests {
         assert_eq!(d.place(StopIndex::new(0, 3)), Some(down(2)));
         let all: Vec<Place> = places(&d);
         assert_eq!(all, [down(0), down(1), up(2), down(2), down(3), down(4)]);
+    }
+
+    fn hebrew(text: &str, isolates: &[(std::ops::Range<usize>, crate::buffer::Direction)], width: i64) -> Display {
+        let inter =
+            Font::from_bytes(include_bytes!("../fonts/Inter-Regular.ttf").to_vec()).unwrap();
+        let noto =
+            Font::from_bytes(include_bytes!("../fonts/NotoSansHebrew-Regular.ttf").to_vec()).unwrap();
+        let mut buffer = crate::buffer::Buffer::new();
+        buffer.insert(0, text).unwrap();
+        for (range, direction) in isolates {
+            buffer.mark_isolate(Range { start: range.start, end: range.end }, *direction).unwrap();
+        }
+        let mut d = Display::new(Arc::new(inter), vec![Arc::new(noto)], 17 * PT, 24 * PT, width * PT);
+        d.set(text, &buffer.isolates());
+        d
+    }
+
+    /// The places on the first line, from the left.
+    fn across(d: &Display) -> Vec<Place> {
+        let line = &d.lines()[0];
+        line.visual.iter().map(|&s| d.place(StopIndex::new(0, s)).unwrap()).collect()
+    }
+
+    #[test]
+    fn hebrew_in_english_has_two_places_at_each_edge() {
+        // אבג is bytes 4..10: its letters start at 4, 6 and 8.
+        let d = hebrew("abc אבג def", &[], 300);
+        let x = |p: Place| d.caret_rect(p).x;
+        // Before the Hebrew in the text: after the space, on its left; or
+        // before its first letter, on its right.
+        assert!(x(up(4)) < x(down(4)));
+        // After it: after its last letter, on its left; or before the
+        // space that follows, on its right.
+        assert!(x(up(10)) < x(down(10)));
+        assert_eq!((x(up(4)), x(down(4))), (x(up(10)), x(down(10))));
+        // Its letters run from the right.
+        assert!(x(down(4)) > x(down(6)) && x(down(6)) > x(down(8)) && x(down(8)) > x(up(10)));
+        // Everywhere else has one place.
+        for o in [0, 1, 2, 3, 6, 8, 11, 12, 13, 14] {
+            assert_eq!(x(up(o)), x(down(o)), "offset {o}");
+        }
+        // Across the page: the English, into the Hebrew at its left edge,
+        // out at its right, the English after.
+        assert_eq!(
+            across(&d),
+            [
+                down(0), down(1), down(2), down(3), up(4), up(10), down(8), down(6), down(4),
+                down(10), down(11), down(12), down(13), down(14)
+            ]
+        );
+    }
+
+    #[test]
+    fn arrows_go_the_way_they_point() {
+        let d = hebrew("abc אבג def", &[], 300);
+        let all = across(&d);
+        // Rightwards visits every place from the left, and leftwards
+        // comes back.
+        let mut at = down(0);
+        let mut seen = vec![at];
+        while let Some(next) = d.place_beside(at, true) {
+            at = next;
+            seen.push(at);
+        }
+        assert_eq!(seen, all);
+        let mut back = vec![at];
+        while let Some(prev) = d.place_beside(at, false) {
+            at = prev;
+            back.push(at);
+        }
+        back.reverse();
+        assert_eq!(back, all);
+        // At the Hebrew's edge a step keeps the cursor's x and changes
+        // which text it's with.
+        assert_eq!(d.place_beside(up(4), true), Some(up(10)));
+        assert_eq!(d.caret_rect(up(4)).x, d.caret_rect(up(10)).x);
+        // Inside it, right is back through the text.
+        assert_eq!(d.place_beside(down(6), true), Some(down(4)));
+        assert_eq!(d.place_beside(down(6), false), Some(down(8)));
+    }
+
+    #[test]
+    fn a_touch_finds_the_place_it_shows() {
+        let d = hebrew("abc אבג def\nאבג abc", &[], 300);
+        for line in 0..d.lines().len() {
+            for stop in 0..d.lines()[line].stops.len() {
+                let p = d.place(StopIndex::new(line, stop)).unwrap();
+                let c = d.caret_rect(p);
+                let found = d.closest_place(c.x, c.y + c.height / 2);
+                assert_eq!(d.caret_rect(found), c, "{p:?} found as {found:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_hebrew_paragraph_is_set_from_the_right() {
+        // אבג 0..6, the space 6, abc 7..10.
+        let d = hebrew("אבג abc", &[], 300);
+        let line = &d.lines()[0];
+        assert!(line.rtl);
+        let x = |p: Place| d.caret_rect(p).x;
+        // It starts at the right edge and its end is on the left.
+        assert_eq!(x(down(0)), 300 * PT);
+        assert_eq!(x(down(0)) - x(down(10)), line.width);
+        // The English word in it runs left to right, in its place.
+        assert!(x(down(7)) < x(down(8)) && x(down(8)) < x(down(9)) && x(down(9)) < x(up(10)));
+        assert!(x(up(10)) < x(down(4)));
+        // So the text's end has two places: after the word's last letter,
+        // and where the paragraph goes on, at its left.
+        assert!(x(down(10)) < x(up(10)));
+        // Past the right end is the line before; past the left, the next.
+        let d = hebrew("אבג\nדהו", &[], 300);
+        assert_eq!(d.place_beside(down(0), true), None);
+        assert_eq!(d.place_beside(down(6), false), Some(down(7)));
+        assert_eq!(d.place_beside(down(7), true), Some(down(6)));
+    }
+
+    #[test]
+    fn a_selection_over_a_change_of_direction() {
+        let d = hebrew("abc אבג def", &[], 300);
+        let x = |p: Place| d.caret_rect(p).x;
+        let r = |a, b| d.selection_rects(Range { start: a, end: b });
+        // Side by side on the page: one rectangle.
+        assert_eq!(r(0, 14).len(), 1);
+        assert_eq!(r(4, 10).len(), 1);
+        assert_eq!((r(4, 10)[0].x, r(4, 10)[0].width), (x(up(10)), x(down(4)) - x(up(10))));
+        // "c " and the first Hebrew letter: next to each other in the
+        // text, apart on the page.
+        let two = r(2, 6);
+        assert_eq!(two.len(), 2);
+        assert_eq!((two[0].x, two[0].x + two[0].width), (x(down(2)), x(up(4))));
+        assert_eq!((two[1].x, two[1].x + two[1].width), (x(down(6)), x(down(4))));
+        // Nothing selected is the cursor.
+        assert_eq!(r(6, 6), [d.caret_rect(down(6))]);
+    }
+
+    #[test]
+    fn an_isolate_holds_its_place_on_the_page() {
+        // A Latin letter in a Hebrew word: אב 4..8, d 8, ג 9..11.
+        let text = "abc אבdג def";
+        let x = |d: &Display, o| d.caret_rect(down(o)).x;
+        // The characters alone put ג on the far side of the d.
+        let loose = hebrew(text, &[], 300);
+        assert!(x(&loose, 9) > x(&loose, 8));
+        // Its isolate keeps the word in order: ג is left of d, d left of ב.
+        let kept = hebrew(text, &[(4..11, crate::buffer::Direction::RightToLeft)], 300);
+        assert!(x(&kept, 9) < x(&kept, 6));
+        assert!(kept.caret_rect(up(9)).x <= x(&kept, 6));
     }
 
     #[test]

@@ -23,7 +23,8 @@ use std::sync::Arc;
 
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::buffer::{Buffer, Edge, Unit};
+use crate::bidi::{self, Stretch};
+use crate::buffer::{Buffer, Edge, Isolate, Unit};
 pub use crate::display::{Affinity, Display, Line, Place, Rect, Stop, StopIndex};
 use crate::layout::Font;
 
@@ -303,6 +304,17 @@ impl Editor {
         self.display.caret_rect(at)
     }
 
+    /// The place beside `at` on the page, to its right or left: what an
+    /// arrow key moves to. See [`Display::place_beside`].
+    pub fn place_beside(&self, at: Place, right: bool) -> Option<Place> {
+        self.display.place_beside(at, right)
+    }
+
+    /// The stretches of the text set in a direction of their own.
+    pub fn isolates(&self) -> Vec<Isolate> {
+        self.buffer.isolates()
+    }
+
     /// The place under (`x`, `y`); see [`Display::closest_place`].
     pub fn closest_place(&self, x: i64, y: i64) -> Place {
         self.display.closest_place(x, y)
@@ -329,7 +341,7 @@ impl Editor {
 
     /// Set the text again `width` scaled points wide.
     pub fn set_width(&mut self, width: i64) {
-        self.display.set_width(width, &self.flat);
+        self.display.set_width(width, &self.flat, &self.buffer.isolates());
     }
 
     // UTF-16, for platforms that count in it
@@ -375,14 +387,88 @@ impl Editor {
     fn splice(&mut self, range: Range<usize>, text: &str) -> (usize, usize) {
         let range = self.clamp(range);
         let text = line_ends(text);
-        let added = self
-            .buffer
-            .replace(range, &text)
+        self.buffer
+            .replace(range, "")
             .expect("the range is clamped to the buffer and to whole characters");
+        let added = self.put(range.start, &text);
         self.layout();
-        // What was typed is before the cursor; what comes next goes after.
-        self.affinity = Affinity::Downstream;
+        // The cursor stays with what was just typed: where its offset has
+        // two places, the one that's the end of the text before it.
+        self.affinity = Affinity::Upstream;
         (range.start, added)
+    }
+
+    /// Puts `text` in at `at`. At the edge of an isolate that runs the
+    /// way the text's first strong character does, it goes in the
+    /// isolate: Hebrew typed at the end of a Hebrew phrase is more of the
+    /// phrase. Anything else (a space, a full stop, a letter that runs
+    /// the other way) goes outside. Returns the bytes added.
+    ///
+    /// This is the editor deciding for the writer. The writer deciding
+    /// (which side a space goes) is to come.
+    fn put(&mut self, at: usize, text: &str) -> usize {
+        let home = bidi::first_strong(text)
+            .filter(|_| !text.contains('\n'))
+            .and_then(|direction| {
+                self.buffer
+                    .isolates()
+                    .into_iter()
+                    .filter(|i| (i.range.start == at || i.range.end == at) && i.direction == direction)
+                    .min_by_key(|i| i.range.len())
+            });
+        let added = match home {
+            Some(isolate) => self.buffer.insert_in(at, text, isolate.id),
+            None => self.buffer.insert(at, text),
+        };
+        added.expect("the offset is clamped to the buffer and to whole characters")
+    }
+
+    /// Makes isolates of the text that has none and wants them: each
+    /// paragraph's stretches that run against it, as Unicode's algorithm
+    /// finds them (see [`bidi::propose`]). What's in an isolate already
+    /// is left as it is.
+    fn propose(&mut self) {
+        let text = self
+            .buffer
+            .read(0, self.buffer.len())
+            .expect("the whole buffer is in bounds")
+            .text
+            .to_string();
+        let mut start = 0;
+        for paragraph in text.split('\n') {
+            let end = start + paragraph.len();
+            // Each step makes one isolate of more text than before, so
+            // there are fewer steps than characters.
+            for _ in 0..=paragraph.len() {
+                let top: Vec<_> = self
+                    .buffer
+                    .isolates()
+                    .into_iter()
+                    .filter(|i| i.parent.is_none() && start <= i.range.start && i.range.end <= end)
+                    .collect();
+                let stretches: Vec<Stretch> = top
+                    .iter()
+                    .map(|i| Stretch {
+                        range: i.range.start - start..i.range.end - start,
+                        direction: i.direction,
+                    })
+                    .collect();
+                let Some(proposal) = bidi::propose(paragraph, &stretches) else {
+                    break;
+                };
+                for &i in &proposal.remove {
+                    let _ = self.buffer.remove_isolate(top[i].id);
+                }
+                let range = Range {
+                    start: start + proposal.mark.range.start,
+                    end: start + proposal.mark.range.end,
+                };
+                if self.buffer.mark_isolate(range, proposal.mark.direction).is_err() {
+                    break;
+                }
+            }
+            start = end + 1;
+        }
     }
 
     fn boundary_at_or_before(&self, offset: usize) -> usize {
@@ -403,6 +489,7 @@ impl Editor {
     /// Copy the buffer out, find its grapheme boundaries, and hand it to
     /// the display to set.
     fn layout(&mut self) {
+        self.propose();
         self.flat = self
             .buffer
             .read(0, self.buffer.len())
@@ -416,7 +503,7 @@ impl Editor {
             .map(|(i, _)| i)
             .chain(std::iter::once(self.flat.len()))
             .collect();
-        self.display.set(&self.flat);
+        self.display.set(&self.flat, &self.buffer.isolates());
     }
 
     fn index_utf16(&mut self) {
@@ -562,6 +649,88 @@ mod tests {
             Some(0)
         );
         assert_eq!(e.offset_by_units(0, Unit::Paragraph, Edge::Start, 1), 24);
+    }
+
+    fn hebrew(text: &str) -> Editor {
+        let inter =
+            Font::from_bytes(include_bytes!("../fonts/Inter-Regular.ttf").to_vec()).unwrap();
+        let noto =
+            Font::from_bytes(include_bytes!("../fonts/NotoSansHebrew-Regular.ttf").to_vec()).unwrap();
+        Editor::new(text, Arc::new(inter), vec![Arc::new(noto)], 17 * PT, 24 * PT, 300 * PT)
+    }
+
+    /// Each isolate's text.
+    fn isolated(e: &Editor) -> Vec<&str> {
+        e.buffer.isolates().iter().map(|i| &e.flat[i.range.clone()]).collect()
+    }
+
+    /// Types `text` a character at a time, as a keyboard does.
+    fn type_in(e: &mut Editor, text: &str) {
+        for c in text.chars() {
+            let at = e.selection();
+            e.replace(at, c.encode_utf8(&mut [0; 4]));
+        }
+    }
+
+    #[test]
+    fn hebrew_in_english_text_is_isolated_as_it_comes() {
+        // Loaded: the algorithm's stretches become isolates.
+        let e = hebrew("abc אבג דהו def\nאבג abc\nplain");
+        assert_eq!(isolated(&e), ["אבג דהו", "abc"]);
+        // Typed: a phrase is one isolate, however it's built up.
+        let mut e = hebrew("say ");
+        e.set_selection(r(4, 4));
+        type_in(&mut e, "אבג");
+        assert_eq!(isolated(&e), ["אבג"]);
+        let id = e.buffer.isolates()[0].id;
+        type_in(&mut e, " ");
+        assert_eq!(isolated(&e), ["אבג"]);
+        type_in(&mut e, "דהו");
+        assert_eq!(isolated(&e), ["אבג דהו"]);
+        // The first word's isolate grew letter by letter; taking in the
+        // second made a new one.
+        assert_ne!(e.buffer.isolates()[0].id, id);
+        // English after it is outside.
+        type_in(&mut e, " end");
+        assert_eq!((e.text(), isolated(&e)), ("say אבג דהו end", vec!["אבג דהו"]));
+    }
+
+    #[test]
+    fn a_letter_typed_into_a_hebrew_word_doesnt_move_it() {
+        // אבג is bytes 4..10; the cursor goes between ב and ג.
+        let mut e = hebrew("abc אבג def");
+        let left = e.caret_rect(Place::upstream(10)).x;
+        let width = e.caret_rect(Place::downstream(4)).x - left;
+        e.set_selection(r(8, 8));
+        e.replace(r(8, 8), "d");
+        assert_eq!((e.text(), isolated(&e)), ("abc אבdג def", vec!["אבdג"]));
+        // On the page, from the left: ג, d, ב, א. The word's left end is
+        // where it was, and it's wider by the d.
+        let x = |p: Place| e.caret_rect(p).x;
+        let (before_d, after_d) = (x(Place::downstream(8)), x(Place::upstream(9)));
+        assert_eq!(x(Place::upstream(11)), left);
+        assert!(left < before_d && before_d < after_d && after_d < x(Place::downstream(4)));
+        assert_eq!(x(Place::downstream(4)) - left, width + (after_d - before_d));
+        // ג is on the d's left, ב on its right.
+        assert_eq!(x(Place::downstream(9)), before_d);
+        assert_eq!(x(Place::upstream(8)), after_d);
+        // The cursor is with the d: on its right, where the next Latin
+        // letter will show.
+        assert_eq!(e.caret(), Place::upstream(9));
+        assert_eq!(e.caret_rect(e.caret()).x, after_d);
+    }
+
+    #[test]
+    fn text_from_elsewhere_keeps_its_isolates() {
+        let mut e = hebrew("abc אבג def");
+        e.replace(r(8, 8), "d");
+        let id = e.buffer.isolates()[0].id;
+        // The block's text comes back from where it's saved, with more
+        // in front. The word is still the isolate it was, Latin letter
+        // and all, where the algorithm would have made two of it.
+        e.set_text("so abc אבdג def");
+        assert_eq!(isolated(&e), ["אבdג"]);
+        assert_eq!(e.buffer.isolates()[0].id, id);
     }
 
     #[test]

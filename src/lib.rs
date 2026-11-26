@@ -1,3 +1,4 @@
+pub mod bidi;
 pub mod buffer;
 pub mod caret;
 pub mod display;
