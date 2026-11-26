@@ -109,6 +109,10 @@ pub struct Line {
     /// of the text either side of them: the one that's the end of what's
     /// on the left first.
     pub visual: Vec<usize>,
+    /// For each stop, which stretch of the line it's a stop of: text at
+    /// one level, side by side on the page. Two stops at one x in
+    /// different stretches are the two sides of a change of direction.
+    pub stretch: Vec<usize>,
     /// Whether the line's paragraph runs right to left: it starts at the
     /// right edge, and its next line is reached off its left end.
     pub rtl: bool,
@@ -214,6 +218,19 @@ impl Display {
             self.width = width;
             self.set(text, isolates);
         }
+    }
+
+    /// The other place at the very spot `at` is on the page, where there
+    /// is one: at a change of direction, the end of the text on one side
+    /// and the edge of the text on the other share an x. It's a different
+    /// offset. `None` anywhere else.
+    pub fn twin(&self, at: Place) -> Option<Place> {
+        let here = self.stop_index(at);
+        let line = self.lines.get(here.line)?;
+        let (x, stretch) = (line.stops.get(here.stop)?.x, *line.stretch.get(here.stop)?);
+        let other = (0..line.stops.len())
+            .find(|&i| i != here.stop && line.stops[i].x == x && line.stretch.get(i) != Some(&stretch))?;
+        self.place(StopIndex::new(here.line, other))
     }
 
     /// The place next to `at` on the page, to its right or its left:
@@ -424,7 +441,7 @@ impl Display {
                 } else {
                     line.text.start + text[line.text.start..line.text.end].trim_end_matches(is_space).len()
                 };
-                let (stops, visual) =
+                let (stops, visual, stretch) =
                     line_stops(&on_line, drawn, &line.glyphs, &levels, base, self.width);
                 lines.push(Line {
                     top: top + line.top,
@@ -440,6 +457,7 @@ impl Display {
                         })
                         .collect(),
                     visual,
+                    stretch,
                     rtl: base % 2 == 1,
                     glyphs: line
                         .glyphs
@@ -530,14 +548,19 @@ fn line_stops(
     levels: &[u8],
     base: u8,
     width: i64,
-) -> (Vec<Stop>, Vec<usize>) {
+) -> (Vec<Stop>, Vec<usize>, Vec<usize>) {
     let level_at = |b: usize| levels.get(b).copied().unwrap_or(base);
     let mut stops: Vec<Stop> = Vec::new();
+    // Which stretch each stop is of, counted as they come.
+    let mut stretch: Vec<usize> = Vec::new();
+    let mut stretches = 0;
     // For each stop, where its stretch is on the page and which way it
     // runs: what orders two stops at one x.
     let mut keys: Vec<(i64, bool)> = Vec::new();
     let content: Vec<usize> = boundaries.iter().copied().filter(|&b| b <= drawn).collect();
     let (mut left, mut right) = (i64::MAX, i64::MIN);
+    // The level of the last stretch drawn.
+    let mut last_level = None;
     let mut i = 0;
     while i + 1 < content.len() {
         let level = level_at(content[i]);
@@ -587,8 +610,11 @@ fn line_stops(
             if stops.last() != Some(&stop) {
                 stops.push(stop);
                 keys.push((x0, rtl));
+                stretch.push(stretches);
             }
         }
+        stretches += 1;
+        last_level = Some(level);
         i = j;
     }
     // What isn't drawn: on from where the text before it ends if it runs
@@ -601,8 +627,10 @@ fn line_stops(
         let x = if base % 2 == 1 { width } else { 0 };
         (left, right) = (x, x);
     }
-    let follows = keys.last().is_some_and(|&(_, last_rtl)| last_rtl == rtl)
-        && stops.last().is_some_and(|s| s.offset == drawn);
+    // Only at the same level: English in a Hebrew phrase that ends an
+    // English paragraph runs the paragraph's way, and still isn't where
+    // the paragraph goes on.
+    let follows = last_level == Some(tail_level) && stops.last().is_some_and(|s| s.offset == drawn);
     let from = match stops.last() {
         Some(s) if follows => s.x,
         _ => if rtl { left } else { right },
@@ -615,6 +643,7 @@ fn line_stops(
         if stops.last() != Some(&stop) {
             stops.push(stop);
             keys.push((from, rtl));
+            stretch.push(stretches);
         }
     }
     // Nothing the cursor can stand at is off the page: text too long to
@@ -630,7 +659,7 @@ fn line_stops(
         let (at, rtl) = keys[i];
         (stops[i].x, at, if rtl { -(i as i64) } else { i as i64 })
     });
-    (stops, visual)
+    (stops, visual, stretch)
 }
 
 #[cfg(test)]
@@ -890,6 +919,45 @@ mod tests {
     }
 
     #[test]
+    fn two_places_share_a_spot_where_direction_changes() {
+        // Hebrew at the end of an English paragraph: אבג is 4..10.
+        let d = hebrew("abc אבג", &[], 300);
+        // Its left edge: the end of the English before it, and its own
+        // end.
+        assert_eq!(d.twin(up(4)), Some(up(10)));
+        assert_eq!(d.twin(up(10)), Some(up(4)));
+        // Its right edge: before its first letter, and the paragraph's
+        // end, where English goes on.
+        assert_eq!(d.twin(down(4)), Some(down(10)));
+        assert_eq!(d.twin(down(10)), Some(down(4)));
+        for (a, b) in [(up(4), up(10)), (down(4), down(10))] {
+            assert_eq!(d.caret_rect(a), d.caret_rect(b));
+        }
+        // Nowhere else.
+        for o in [0, 1, 2, 3, 6, 8] {
+            assert_eq!(d.twin(down(o)), None, "offset {o}");
+        }
+        assert_eq!(display("plain text", 300).twin(down(5)), None);
+    }
+
+    #[test]
+    fn a_paragraphs_end_is_its_own_place() {
+        // English held in a Hebrew phrase, at the end of an English
+        // paragraph: אבג 4..10, a space, abc 11..14, all in the phrase.
+        // The English is drawn at the phrase's left, so its end is
+        // there; the paragraph's end is at the line's right.
+        let d = hebrew("say אבג abc", &[(4..14, crate::buffer::Direction::RightToLeft)], 300);
+        let (word_end, paragraph_end) = (d.caret_rect(up(14)).x, d.caret_rect(down(14)).x);
+        assert!(word_end < d.caret_rect(up(10)).x);
+        assert!(paragraph_end > d.caret_rect(down(4)).x - 1);
+        assert_eq!(paragraph_end, d.caret_rect(down(4)).x);
+        // The word's end shares its spot with the end of the Hebrew and
+        // its space; the paragraph's end with the Hebrew's start.
+        assert_eq!(d.twin(up(14)), Some(up(11)));
+        assert_eq!(d.twin(down(14)), Some(down(4)));
+    }
+
+    #[test]
     fn arrows_go_the_way_they_point() {
         let d = hebrew("abc אבג def", &[], 300);
         let all = across(&d);
@@ -1007,6 +1075,27 @@ mod tests {
         assert!(spaced.caret_rect(down(6)).x < english_left);
         // The Hebrew hasn't moved.
         assert_eq!(spaced.caret_rect(down(0)).x, d.caret_rect(down(0)).x);
+    }
+
+    #[test]
+    fn spaces_at_a_lines_end_never_rewrap_it() {
+        // Two Hebrew words and then spaces, on and on. The words stay on
+        // their line, where they were; the spaces hang off its end.
+        let words = "אבג דהו";
+        let before = hebrew(words, &[], 120);
+        let after = hebrew(&format!("{words}{}", " ".repeat(200)), &[], 120);
+        assert_eq!((before.lines().len(), after.lines().len()), (1, 1));
+        for o in [0, 2, 6, 7, 11, 13] {
+            assert_eq!(after.caret_rect(down(o)).x, before.caret_rect(down(o)).x, "offset {o}");
+        }
+        // The cursor after them is at the paragraph's far edge: the left.
+        assert_eq!(after.caret_rect(down(13 + 200)).x, 0);
+        // The same in English: the word stays, the cursor's at the right.
+        let before = display("word", 120);
+        let after = display(&format!("word{}", " ".repeat(200)), 120);
+        assert_eq!(after.lines().len(), 1);
+        assert_eq!(after.caret_rect(down(2)).x, before.caret_rect(down(2)).x);
+        assert_eq!(after.caret_rect(down(204)).x, 120 * PT);
     }
 
     #[test]

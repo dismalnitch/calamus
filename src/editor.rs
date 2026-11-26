@@ -262,17 +262,21 @@ impl Editor {
     /// next will run, and whether there's another side here to choose.
     pub fn caret_side(&self) -> Side {
         let at = self.selection.end;
-        let (here, there) = (self.home(at, self.affinity), self.home(at, self.other_side()));
-        let apart = here.as_ref().map(|i| i.id) != there.as_ref().map(|i| i.id);
-        // Two places on one line: a change of direction. (On two lines
-        // it's a line broken with no space, which is no choice of side.)
-        let (before, after) = (self.caret_rect(Place::upstream(at)), self.caret_rect(Place::downstream(at)));
-        let places = before.y == after.y && before.x != after.x;
+        let here = self.home(at, self.affinity);
+        let caret = self.selection.start == self.selection.end;
         Side {
             direction: self.runs(&here, at),
-            choice: self.selection.start == self.selection.end && (apart || places),
+            choice: caret && (self.display.twin(self.caret()).is_some() || self.apart()),
             held: self.held,
         }
+    }
+
+    /// Whether the cursor's offset is the edge of an isolate: in it on one
+    /// side, out of it on the other.
+    fn apart(&self) -> bool {
+        let at = self.selection.end;
+        let (here, there) = (self.home(at, self.affinity), self.home(at, self.other_side()));
+        here.map(|i| i.id) != there.map(|i| i.id)
     }
 
     /// The isolate that what's typed is being kept in, whatever its
@@ -287,27 +291,68 @@ impl Editor {
         self.home(self.selection.end, self.affinity)
     }
 
-    /// Puts the cursor on the other side of where it is, and holds it
-    /// there: what's typed next stays on that side whatever its script,
-    /// until the cursor's moved. English typed at the end of a Hebrew
-    /// phrase, held inside, is part of the phrase. `false`, and nothing
-    /// changes, where there's one side.
+    /// The way text typed at `at` would run.
+    fn runs_at(&self, at: Place) -> Direction {
+        self.runs(&self.home(at.offset, at.affinity), at.offset)
+    }
+
+    /// Puts the cursor on the other side of where it is, without moving
+    /// it on the page, and holds it there: what's typed next stays on
+    /// that side whatever its script, until the cursor's moved.
+    ///
+    /// At a change of direction two places share the cursor's spot: at
+    /// the right of Hebrew that ends an English line, "before the
+    /// Hebrew's first letter" and "after everything, where English goes
+    /// on". This goes from one to the other. Where an isolate's edge
+    /// isn't a change of direction, it goes in or out of the isolate.
+    /// `false`, and nothing changes, where there's one side.
     pub fn flip_side(&mut self) -> bool {
-        if !self.caret_side().choice {
+        if self.selection.start != self.selection.end {
             return false;
         }
-        self.affinity = self.other_side();
+        if let Some(twin) = self.display.twin(self.caret()) {
+            self.selection = Range { start: twin.offset, end: twin.offset };
+            self.affinity = twin.affinity;
+        } else if self.apart() {
+            self.affinity = self.other_side();
+        } else {
+            return false;
+        }
         self.held = true;
+        true
+    }
+
+    /// The cursor has just been put somewhere (a touch), and the keyboard
+    /// types text that runs `direction`: where two places share its spot,
+    /// it takes the one that runs the keyboard's way. A touch at the
+    /// right of Hebrew that ends an English line is "before the Hebrew"
+    /// with a Hebrew keyboard, "after it" with an English one. Says
+    /// whether it changed. Not if the writer is holding a side.
+    pub fn settle(&mut self, direction: Direction) -> bool {
+        if self.held || self.selection.start != self.selection.end {
+            return false;
+        }
+        let here = self.caret();
+        let Some(twin) = self.display.twin(here) else {
+            return false;
+        };
+        if self.runs_at(here) == direction || self.runs_at(twin) != direction {
+            return false;
+        }
+        self.selection = Range { start: twin.offset, end: twin.offset };
+        self.affinity = twin.affinity;
         true
     }
 
     /// The writer is about to type text that runs `direction` (they've
     /// changed keyboard): if the cursor's other side runs that way and
-    /// this one doesn't, it goes over. Not if they're holding the side.
+    /// this one doesn't, it goes over, to where that text will show.
+    /// That's the other end of the phrase it's at, as other editors have
+    /// it. Not if they're holding the side, or the cursor stays put.
     /// Says whether it moved.
     pub fn face(&mut self, direction: Direction) -> bool {
         let at = self.selection.end;
-        if self.held || self.stays_put || !self.caret_side().choice {
+        if self.held || self.stays_put || self.selection.start != self.selection.end || !self.apart() {
             return false;
         }
         let (here, there) = (self.home(at, self.affinity), self.home(at, self.other_side()));
@@ -1027,9 +1072,14 @@ mod tests {
         type_in(&mut e, " x");
         assert_eq!(isolated(&e), ["אבג"]);
         // ...unless the side's held: then it's part of the phrase, and
-        // set in it.
+        // set in it. The cursor's at the phrase's end, on its left; a
+        // flip takes it to the other side of that spot, the end of the
+        // English before, and a second brings it back, held.
         let mut e = hebrew("say אבג");
-        e.set_caret(Place::downstream(10));
+        e.set_caret(Place::upstream(10));
+        let x = e.caret_rect(e.caret()).x;
+        assert!(e.flip_side());
+        assert_eq!((e.caret(), e.caret_rect(e.caret()).x), (Place::upstream(4), x));
         assert_eq!(e.caret_side().direction, Direction::LeftToRight);
         assert!(e.flip_side());
         assert_eq!((e.caret(), e.caret_side().held), (Place::upstream(10), true));
@@ -1039,17 +1089,47 @@ mod tests {
         // Moving the cursor lets go.
         e.set_caret(Place::downstream(4));
         assert!(!e.caret_side().held);
-        // Outside held, Hebrew typed beside the phrase isn't in it.
+        // Held on the English side of that spot, Hebrew typed there is
+        // before the phrase, and not in it.
         let mut e = hebrew("say אבג");
         e.set_caret(Place::upstream(10));
         assert!(e.flip_side());
-        assert_eq!(e.caret(), Place::downstream(10));
         type_in(&mut e, "ד");
-        assert_eq!(e.text(), "say אבגד");
-        assert_eq!(isolated(&e), ["אבג", "ד"]);
+        assert_eq!(e.text(), "say דאבג");
+        assert_eq!(isolated(&e), ["ד", "אבג"]);
+        // At the phrase's right, the flip is between "before its first
+        // letter" and "after everything", and the cursor doesn't move.
+        let mut e = hebrew("say אבג");
+        e.set_caret(Place::downstream(10));
+        let x = e.caret_rect(e.caret()).x;
+        assert!(e.flip_side());
+        assert_eq!((e.caret(), e.caret_rect(e.caret()).x), (Place::downstream(4), x));
+        assert_eq!(e.caret_side().direction, Direction::RightToLeft);
         // Where there's one side, there's nothing to flip.
         e.set_caret(Place::downstream(1));
         assert!(!e.flip_side());
+    }
+
+    #[test]
+    fn a_touch_takes_the_keyboards_side() {
+        // At the right of Hebrew that ends an English line.
+        let mut e = hebrew("say אבג");
+        e.set_caret(Place::downstream(10));
+        // English keyboard: it's after everything already.
+        assert!(!e.settle(Direction::LeftToRight));
+        // Hebrew keyboard: before the Hebrew's first letter, same spot.
+        let x = e.caret_rect(e.caret()).x;
+        assert!(e.settle(Direction::RightToLeft));
+        assert_eq!((e.caret(), e.caret_rect(e.caret()).x), (Place::downstream(4), x));
+        assert!(!e.caret_side().held);
+        // And back with the English one.
+        assert!(e.settle(Direction::LeftToRight));
+        assert_eq!(e.caret(), Place::downstream(10));
+        // A held side isn't taken away, and the middle of text has one.
+        e.flip_side();
+        assert!(!e.settle(Direction::LeftToRight));
+        e.set_caret(Place::downstream(6));
+        assert!(!e.settle(Direction::LeftToRight));
     }
 
     #[test]
@@ -1074,8 +1154,9 @@ mod tests {
         // While it's in the phrase, the phrase is what's shown as holding
         // it.
         assert_eq!(e.kept_in().map(|i| &e.flat[i.range]), Some("אבג ab"));
-        // The writer steps out, and then it's English's side.
-        assert!(e.flip_side());
+        // The writer steps out, to the line's end, and there it's
+        // English's side.
+        e.set_caret(Place::downstream(13));
         assert_eq!(e.kept_in(), None);
         type_in(&mut e, " end");
         assert_eq!((e.text(), isolated(&e)), ("say אבג ab end", vec!["אבג ab"]));

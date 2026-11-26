@@ -707,8 +707,16 @@ fn itemize(
                 // line like any text: they can't stretch, or be broken
                 // from what they follow.
                 if keep_spaces && space_end > content_end {
+                    // At the paragraph's own level they're at the line's
+                    // end, and hang: they're drawn (out past the edge if
+                    // need be) but count nothing toward where lines
+                    // break, so typing spaces never sends the word before
+                    // them to the next line. Deeper (in an isolate) they
+                    // sit inside the line, and take their room.
+                    let hang = (content_end..space_end).all(|at| shaper.level(at) == base);
                     let spaces = shaper.shape(text, content_end..space_end);
-                    push(Item::Box { width: width(&shaper.glyphs, &spaces) }, spaces, space_end);
+                    let room = if hang { 0 } else { width(&shaper.glyphs, &spaces) };
+                    push(Item::Box { width: room }, spaces, space_end);
                 }
                 end_of_paragraph(&mut push, shaper.glyphs.len(), end);
             }
@@ -906,8 +914,10 @@ fn set_lines(
         if let Item::Penalty { width, .. } = items[at] {
             pen += width;
         }
-        // A paragraph that runs right to left starts at the right edge.
-        if base % 2 == 1 && style.align == Align::Ragged && pen < width {
+        // A paragraph that runs right to left starts at the right edge:
+        // what doesn't fit (spaces hanging at its end, a word too long
+        // to break) runs out past the left one.
+        if base % 2 == 1 && style.align == Align::Ragged {
             for g in &mut placed {
                 g.x += width - pen;
             }
