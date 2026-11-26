@@ -60,7 +60,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 [[package]]
 name = "mamre"
 version = "0.1.0"
-source = "git+https://github.com/dismalnitch/mamre?rev=d228a81e#d228a81eb24715297fe8b50f711e0a62620ea85b"
+source = "git+https://github.com/dismalnitch/mamre?rev=a14533f2#a14533f22ed4329a6e45491c64cda3c4fea24433"
 dependencies = [
  "arrayvec",
 ]
@@ -68,7 +68,7 @@ dependencies = [
 [[package]]
 name = "mamre-rope"
 version = "0.1.0"
-source = "git+https://github.com/dismalnitch/mamre?rev=d228a81e#d228a81eb24715297fe8b50f711e0a62620ea85b"
+source = "git+https://github.com/dismalnitch/mamre?rev=a14533f2#a14533f22ed4329a6e45491c64cda3c4fea24433"
 dependencies = [
  "arrayvec",
  "mamre",

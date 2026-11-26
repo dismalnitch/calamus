@@ -21,7 +21,6 @@
 use std::range::Range;
 use std::sync::Arc;
 
-use mamre_rope::{Measure, Rope};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::buffer::{Buffer, Edge, Unit};
@@ -41,7 +40,6 @@ pub struct Editor {
     display: Display,
     selection: Range<usize>,
     marked: Option<Range<usize>>,
-    ko_caret_flowers: Rope,
     /// Every grapheme cluster boundary in the text, in order.
     boundaries: Vec<usize>,
 }
@@ -66,7 +64,6 @@ impl Editor {
             display: Display::new(font, fallback, size, line_height, width),
             selection: Range { start: 0, end: 0 },
             marked: None,
-            ko_caret_flowers: Rope::new(),
             boundaries: Vec::new(),
         };
         editor.splice(Range { start: 0, end: 0 }, text);
