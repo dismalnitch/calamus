@@ -97,6 +97,21 @@ impl Buffer {
         Self { text: Text::new(writer) }
     }
 
+    /// The buffer a history holds: its text, and everything the history
+    /// keeps beside it, edited from now on by `writer`. `None` if the
+    /// bytes aren't a history ([`Buffer::history`] wrote).
+    pub fn open(writer: &str, history: &[u8]) -> Option<Self> {
+        Text::open(writer, history).ok().map(|text| Self { text })
+    }
+
+    /// The buffer's whole history, to keep: the text, every edit that
+    /// made it, and its isolates. [`Buffer::open`] reads it back.
+    pub fn history(&mut self) -> Vec<u8> {
+        let mut file = Vec::new();
+        self.text.save(&mut file);
+        file
+    }
+
     /// The text, to read.
     fn rope(&self) -> &Rope {
         self.text.rope()
@@ -426,6 +441,28 @@ mod tests {
         assert_eq!(b.remove_isolate(id), Ok(()));
         assert_eq!(b.isolates(), []);
         assert_eq!(b.remove_isolate(id), Err(BufferError::NoSuchIsolate));
+    }
+
+    #[test]
+    fn a_history_brings_everything_back() {
+        let mut b = Buffer::with_writer("me");
+        b.insert(0, "abc אבג def").unwrap();
+        let id = b.mark_isolate(Range { start: 4, end: 10 }, Direction::RightToLeft).unwrap();
+        b.insert_in(10, " x", id).unwrap();
+        let kept = b.history();
+        // The same writer carries on where they left off.
+        let mut back = Buffer::open("me", &kept).unwrap();
+        assert_eq!(back.read(0, back.len()).unwrap().text.to_string(), "abc אבג x def");
+        assert_eq!(back.isolates(), b.isolates());
+        back.insert_in(12, "y", id).unwrap();
+        assert_eq!(back.isolates()[0].range, 4..13);
+        // And what they add is kept in turn.
+        let again = Buffer::open("me", &back.history()).unwrap();
+        assert_eq!(again.isolates(), back.isolates());
+        assert_eq!(again.len(), back.len());
+        // Bytes that aren't a history are nothing.
+        assert!(Buffer::open("me", b"abc").is_none());
+        assert!(Buffer::open("me", b"").is_none());
     }
 
     #[test]

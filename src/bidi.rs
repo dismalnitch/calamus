@@ -141,8 +141,10 @@ pub fn levels(paragraph: &str, isolates: &[Stretch]) -> Vec<u8> {
 /// The algorithm reads the bare characters and finds each stretch set
 /// against the paragraph. A stretch no isolate holds becomes one. A
 /// stretch that takes in isolates of its own direction and more besides
-/// (a second Hebrew word typed after a space, outside the first's
-/// isolate) becomes one isolate over all of it, in place of those. A
+/// (a second Hebrew word pasted after a space, outside the first's
+/// isolate) becomes one isolate over all of it, in place of those; but a
+/// letter set hard against an isolate, outside it, was put there on
+/// purpose, and is made an isolate of its own. A
 /// stretch already inside an isolate is left alone, as is anything near
 /// an isolate that runs the other way: someone meant that.
 pub fn propose(paragraph: &str, isolates: &[Stretch]) -> Option<Proposal> {
@@ -182,6 +184,43 @@ pub fn propose(paragraph: &str, isolates: &[Stretch]) -> Option<Proposal> {
         };
         if touching.iter().any(|&i| holds(i)) {
             continue;
+        }
+        // What of the stretch no isolate holds, piece by piece.
+        let mut loose: Vec<Range<usize>> = Vec::new();
+        let mut from = found.range.start;
+        for &i in &touching {
+            if isolates[i].range.start > from {
+                loose.push(from..isolates[i].range.start);
+            }
+            from = from.max(isolates[i].range.end);
+        }
+        if found.range.end > from {
+            loose.push(from..found.range.end);
+        }
+        if loose.is_empty() {
+            continue;
+        }
+        // A piece whose own letter is hard against an isolate was put
+        // there on purpose (text typed at an isolate's edge joins it
+        // unless the writer says not): it's an isolate of its own. With a
+        // space between, it's more of the same phrase.
+        let ends = |at: usize| touching.iter().any(|&i| isolates[i].range.end == at);
+        let starts = |at: usize| touching.iter().any(|&i| isolates[i].range.start == at);
+        let strong =
+            |c: Option<char>| c.is_some_and(|c| first_strong(c.encode_utf8(&mut [0; 4])).is_some());
+        let apart = loose.iter().find(|piece| {
+            let text = &paragraph[piece.start..piece.end];
+            (ends(piece.start) && strong(text.chars().next()))
+                || (starts(piece.end) && strong(text.chars().next_back()))
+        });
+        if let Some(piece) = apart {
+            return Some(Proposal {
+                remove: vec![],
+                mark: Stretch {
+                    range: piece.clone(),
+                    direction: found.direction,
+                },
+            });
         }
         let from = touching
             .iter()
@@ -324,16 +363,33 @@ mod tests {
                 mark: stretch(text, "אבג ד", Rtl)
             })
         );
-        // And two isolates with Hebrew typed between them become one.
-        let text = "x בגד הו zz";
+        // And two isolates with a word put between them, spaces either
+        // side, become one.
+        let text = "x בג ד הו zz";
         let isolates = [stretch(text, "בג", Rtl), stretch(text, "הו", Rtl)];
         assert_eq!(
             propose(text, &isolates),
             Some(Proposal {
                 remove: vec![0, 1],
-                mark: stretch(text, "בגד הו", Rtl)
+                mark: stretch(text, "בג ד הו", Rtl)
             })
         );
+    }
+
+    #[test]
+    fn a_letter_hard_against_an_isolate_is_its_own() {
+        // ד was typed outside אבג's isolate, with nothing between.
+        let text = "abc אבגד";
+        let first = stretch(text, "אבג", Rtl);
+        assert_eq!(
+            propose(text, &[first.clone()]),
+            Some(Proposal {
+                remove: vec![],
+                mark: stretch(text, "ד", Rtl)
+            })
+        );
+        // And then there's nothing more to say.
+        assert_eq!(propose(text, &[first, stretch(text, "ד", Rtl)]), None);
     }
 
     #[test]

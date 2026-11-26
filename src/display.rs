@@ -434,7 +434,8 @@ impl Display {
                 // the text's end: a space typed there, or deleted,
                 // wouldn't move the cursor. Step past each one.
                 let step = if last { space } else { 0 };
-                let (stops, visual) = line_stops(&on_line, drawn, &line.glyphs, &levels, base, self.width, step);
+                let (stops, visual) =
+                    line_stops(&on_line, drawn, &line.glyphs, &levels, base, self.width, step, last);
                 lines.push(Line {
                     top: top + line.top,
                     height: line.height,
@@ -528,7 +529,9 @@ fn extent(line: &Line) -> (i64, i64) {
 /// same x.
 ///
 /// Past `drawn` there's nothing drawn: each boundary there steps `step`
-/// further on, the way its level runs.
+/// further on, the way its level runs. `ends` says the paragraph ends on
+/// this line.
+#[allow(clippy::too_many_arguments)]
 fn line_stops(
     boundaries: &[usize],
     drawn: usize,
@@ -537,6 +540,7 @@ fn line_stops(
     base: u8,
     width: i64,
     step: i64,
+    ends: bool,
 ) -> (Vec<Stop>, Vec<usize>) {
     let level_at = |b: usize| levels.get(b).copied().unwrap_or(base);
     let mut stops: Vec<Stop> = Vec::new();
@@ -627,6 +631,15 @@ fn line_stops(
             stops.push(stop);
             keys.push((from.min(x), rtl));
         }
+    }
+    // A paragraph ends at its own level. If what's last on its last line
+    // runs the other way (spaces typed inside an isolate), its end has a
+    // second place: where the paragraph itself goes on.
+    let para_rtl = base % 2 == 1;
+    if let Some(&offset) = boundaries.last().filter(|&&b| ends && b > drawn && rtl != para_rtl) {
+        let x = if para_rtl { left } else { right };
+        stops.push(Stop { offset, x });
+        keys.push((x, para_rtl));
     }
     // On the page: by x; at one x, the stretch further left first; in one
     // stretch (clusters with no width), the way it runs.

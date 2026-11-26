@@ -25,8 +25,22 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::bidi::{self, Stretch};
 use crate::buffer::{Buffer, Edge, Isolate, Unit};
+pub use crate::buffer::Direction;
 pub use crate::display::{Affinity, Display, Line, Place, Rect, Stop, StopIndex};
 use crate::layout::Font;
+
+/// The side of its offset the cursor is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Side {
+    /// Which way what's typed here will run: the isolate's the cursor is
+    /// in, or the paragraph's.
+    pub direction: Direction,
+    /// Whether the offset has another side: the edge of an isolate, or
+    /// two places on the page.
+    pub choice: bool,
+    /// Whether the writer chose this side, so typing won't leave it.
+    pub held: bool,
+}
 
 pub struct Editor {
     buffer: Buffer,
@@ -43,6 +57,13 @@ pub struct Editor {
     /// Which of its offset's places the cursor is at, while the selection
     /// is empty.
     affinity: Affinity,
+    /// Whether the writer chose the cursor's side ([`Editor::flip_side`]):
+    /// then what's typed stays on it, whatever its script, until the
+    /// cursor's moved.
+    held: bool,
+    /// Whether only the writer moves the cursor between sides
+    /// ([`Editor::set_stays_put`]).
+    stays_put: bool,
     marked: Option<Range<usize>>,
     /// Every grapheme cluster boundary in the text, in order.
     boundaries: Vec<usize>,
@@ -60,19 +81,65 @@ impl Editor {
         line_height: i64,
         width: i64,
     ) -> Self {
-        let mut editor = Editor {
-            buffer: Buffer::new(),
+        let mut editor = Self::over(Buffer::new(), font, fallback, size, line_height, width);
+        editor.splice(Range { start: 0, end: 0 }, text);
+        editor
+    }
+
+    /// An editor for `text` whose history was kept ([`Editor::history`]):
+    /// the text as it was left, isolates and all, edited from now on by
+    /// `writer` (a name no other device editing the same text uses).
+    ///
+    /// The history is what's kept beside the text; `text` is the text
+    /// itself, as whatever stores it has it. If they differ (it was
+    /// edited somewhere this history never heard of), the history is
+    /// brought to the text: what's the same keeps its isolates. With no
+    /// history, or bytes that aren't one, it's a new editor for `text`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open(
+        history: &[u8],
+        writer: &str,
+        text: &str,
+        font: Arc<Font>,
+        fallback: Vec<Arc<Font>>,
+        size: i64,
+        line_height: i64,
+        width: i64,
+    ) -> Self {
+        let buffer = Buffer::open(writer, history).unwrap_or_else(|| Buffer::with_writer(writer));
+        let mut editor = Self::over(buffer, font, fallback, size, line_height, width);
+        editor.buffer.reconcile(&line_ends(text));
+        editor.layout();
+        editor
+    }
+
+    /// The editor's whole history, to keep beside its text: every edit,
+    /// and the isolates. [`Editor::open`] takes it.
+    pub fn history(&mut self) -> Vec<u8> {
+        self.buffer.history()
+    }
+
+    fn over(
+        buffer: Buffer,
+        font: Arc<Font>,
+        fallback: Vec<Arc<Font>>,
+        size: i64,
+        line_height: i64,
+        width: i64,
+    ) -> Self {
+        Editor {
+            buffer,
             flat: String::new(),
             utf16_of_byte: Vec::new(),
             byte_of_utf16: Vec::new(),
             display: Display::new(font, fallback, size, line_height, width),
             selection: Range { start: 0, end: 0 },
             affinity: Affinity::Downstream,
+            held: false,
+            stays_put: false,
             marked: None,
             boundaries: Vec::new(),
-        };
-        editor.splice(Range { start: 0, end: 0 }, text);
-        editor
+        }
     }
 
     // pub fn measure() -> Measure {
@@ -162,8 +229,100 @@ impl Editor {
     /// Put the cursor at `at` (moved back to a whole grapheme cluster),
     /// selecting nothing.
     pub fn set_caret(&mut self, at: Place) {
+        // Told where it already is, it's still where the writer put it.
+        let held = self.held && self.selection.start == self.selection.end && at == self.caret();
         self.set_selection(Range { start: at.offset, end: at.offset });
         self.affinity = at.affinity;
+        self.held = held;
+    }
+
+    /// How the cursor behaves at the edge of text that runs against
+    /// what's round it.
+    ///
+    /// Off, the way most editors do it: a letter that runs the other way
+    /// from the cursor's side goes to the other side (English typed at
+    /// the end of a Hebrew phrase leaves the phrase), and a change of
+    /// keyboard turns the cursor ([`Editor::face`]). The letter, or the
+    /// cursor, jumps to the phrase's other end.
+    ///
+    /// On, the cursor stays where the writer put it: everything typed
+    /// goes to its side, whatever its script, and nothing but the writer
+    /// ([`Editor::flip_side`], an arrow key, a touch) takes it to the
+    /// other. English typed at the end of a Hebrew phrase is in the
+    /// phrase until they step out.
+    pub fn set_stays_put(&mut self, on: bool) {
+        self.stays_put = on;
+    }
+
+    pub fn stays_put(&self) -> bool {
+        self.stays_put
+    }
+
+    /// The cursor's side, for showing the writer: which way what's typed
+    /// next will run, and whether there's another side here to choose.
+    pub fn caret_side(&self) -> Side {
+        let at = self.selection.end;
+        let (here, there) = (self.home(at, self.affinity), self.home(at, self.other_side()));
+        let apart = here.as_ref().map(|i| i.id) != there.as_ref().map(|i| i.id);
+        // Two places on one line: a change of direction. (On two lines
+        // it's a line broken with no space, which is no choice of side.)
+        let (before, after) = (self.caret_rect(Place::upstream(at)), self.caret_rect(Place::downstream(at)));
+        let places = before.y == after.y && before.x != after.x;
+        Side {
+            direction: self.runs(&here, at),
+            choice: self.selection.start == self.selection.end && (apart || places),
+            held: self.held,
+        }
+    }
+
+    /// The isolate that what's typed is being kept in, whatever its
+    /// script: the cursor's, while the writer holds its side or the
+    /// cursor stays put. For showing them, since English typed into
+    /// Hebrew this way is in the Hebrew and looks it. `None` when typing
+    /// goes where its script takes it, or the cursor's in no isolate.
+    pub fn kept_in(&self) -> Option<Isolate> {
+        if self.selection.start != self.selection.end || !(self.held || self.stays_put) {
+            return None;
+        }
+        self.home(self.selection.end, self.affinity)
+    }
+
+    /// Puts the cursor on the other side of where it is, and holds it
+    /// there: what's typed next stays on that side whatever its script,
+    /// until the cursor's moved. English typed at the end of a Hebrew
+    /// phrase, held inside, is part of the phrase. `false`, and nothing
+    /// changes, where there's one side.
+    pub fn flip_side(&mut self) -> bool {
+        if !self.caret_side().choice {
+            return false;
+        }
+        self.affinity = self.other_side();
+        self.held = true;
+        true
+    }
+
+    /// The writer is about to type text that runs `direction` (they've
+    /// changed keyboard): if the cursor's other side runs that way and
+    /// this one doesn't, it goes over. Not if they're holding the side.
+    /// Says whether it moved.
+    pub fn face(&mut self, direction: Direction) -> bool {
+        let at = self.selection.end;
+        if self.held || self.stays_put || !self.caret_side().choice {
+            return false;
+        }
+        let (here, there) = (self.home(at, self.affinity), self.home(at, self.other_side()));
+        if self.runs(&here, at) == direction || self.runs(&there, at) != direction {
+            return false;
+        }
+        self.affinity = self.other_side();
+        true
+    }
+
+    fn other_side(&self) -> Affinity {
+        match self.affinity {
+            Affinity::Upstream => Affinity::Downstream,
+            Affinity::Downstream => Affinity::Upstream,
+        }
     }
 
     /// Select `range`, widened to whole grapheme clusters: a selection never
@@ -173,6 +332,7 @@ impl Editor {
     /// [`set_caret`]: Editor::set_caret
     pub fn set_selection(&mut self, range: Range<usize>) {
         self.affinity = Affinity::Downstream;
+        self.held = false;
         let len = self.len();
         let (a, b) = (
             range.start.min(range.end).min(len),
@@ -387,10 +547,23 @@ impl Editor {
     fn splice(&mut self, range: Range<usize>, text: &str) -> (usize, usize) {
         let range = self.clamp(range);
         let text = line_ends(text);
+        // Typed at the cursor, text goes to the cursor's side. Typed or
+        // pasted over text, it goes where that text began: in the isolate
+        // its first character was in, if any of that isolate is left.
+        let typed = range.start == range.end
+            && self.selection.start == self.selection.end
+            && range.start == self.selection.end;
+        let began = (range.start < range.end).then(|| self.home(range.start, Affinity::Downstream).map(|i| i.id));
         self.buffer
             .replace(range, "")
             .expect("the range is clamped to the buffer and to whole characters");
-        let added = self.put(range.start, &text);
+        let side = match began {
+            None => typed.then_some(self.affinity),
+            Some(began) => [Affinity::Upstream, Affinity::Downstream]
+                .into_iter()
+                .find(|&side| self.home(range.start, side).map(|i| i.id) == began),
+        };
+        let added = self.put(range.start, &text, side);
         self.layout();
         // The cursor stays with what was just typed: where its offset has
         // two places, the one that's the end of the text before it.
@@ -398,29 +571,121 @@ impl Editor {
         (range.start, added)
     }
 
-    /// Puts `text` in at `at`. At the edge of an isolate that runs the
-    /// way the text's first strong character does, it goes in the
-    /// isolate: Hebrew typed at the end of a Hebrew phrase is more of the
-    /// phrase. Anything else (a space, a full stop, a letter that runs
-    /// the other way) goes outside. Returns the bytes added.
+    /// The innermost isolate on `side` of byte `at`: the one holding the
+    /// character before it (upstream) or after it (downstream).
+    fn home(&self, at: usize, side: Affinity) -> Option<Isolate> {
+        self.buffer
+            .isolates()
+            .into_iter()
+            .filter(|i| match side {
+                Affinity::Upstream => i.range.start < at && at <= i.range.end,
+                Affinity::Downstream => i.range.start <= at && at < i.range.end,
+            })
+            .min_by_key(|i| i.range.len())
+    }
+
+    /// The way text in `home` runs: the isolate's, or with none, the way
+    /// the paragraph at `at` does.
+    fn runs(&self, home: &Option<Isolate>, at: usize) -> Direction {
+        if let Some(isolate) = home {
+            return isolate.direction;
+        }
+        let text = self
+            .buffer
+            .read(0, self.buffer.len())
+            .expect("the whole buffer is in bounds")
+            .text
+            .to_string();
+        let from = text[..at].rfind('\n').map_or(0, |i| i + 1);
+        let to = text[at..].find('\n').map_or(text.len(), |i| at + i);
+        if bidi::base(&text[from..to]) % 2 == 1 {
+            Direction::RightToLeft
+        } else {
+            Direction::LeftToRight
+        }
+    }
+
+    /// Puts `text` in at `at`. Returns the bytes added.
     ///
-    /// This is the editor deciding for the writer. The writer deciding
-    /// (which side a space goes) is to come.
-    fn put(&mut self, at: usize, text: &str) -> usize {
-        let home = bidi::first_strong(text)
-            .filter(|_| !text.contains('\n'))
-            .and_then(|direction| {
+    /// Typed at the cursor (`side` is the cursor's), it goes to the
+    /// cursor's side: at an isolate's edge, into the isolate or outside
+    /// it, as the cursor is. So a space typed after a Hebrew word stays
+    /// with the word, and the cursor stays where it was going.
+    ///
+    /// A strong letter chooses for itself, unless the writer is holding
+    /// the side or the cursor stays put ([`Editor::set_stays_put`]): one
+    /// that runs against the cursor's side and with the
+    /// other goes to the other. English typed at the end of a Hebrew
+    /// phrase leaves the phrase, and takes the spaces at its end along:
+    /// they were typed on the way out.
+    ///
+    /// Put in anywhere else (`side` is `None`), a strong letter at the
+    /// edge of an isolate that runs its way joins it, and anything else
+    /// goes outside.
+    fn put(&mut self, at: usize, text: &str, side: Option<Affinity>) -> usize {
+        let done = "the offset is clamped to the buffer and to whole characters";
+        let strong = bidi::first_strong(text);
+        let Some(side) = side.filter(|_| !text.contains('\n')) else {
+            let home = strong.filter(|_| !text.contains('\n')).and_then(|direction| {
                 self.buffer
                     .isolates()
                     .into_iter()
                     .filter(|i| (i.range.start == at || i.range.end == at) && i.direction == direction)
                     .min_by_key(|i| i.range.len())
             });
-        let added = match home {
-            Some(isolate) => self.buffer.insert_in(at, text, isolate.id),
-            None => self.buffer.insert(at, text),
+            return match home {
+                Some(isolate) => self.buffer.insert_in(at, text, isolate.id),
+                None => self.buffer.insert(at, text),
+            }
+            .expect(done);
         };
-        added.expect("the offset is clamped to the buffer and to whole characters")
+        let other = match side {
+            Affinity::Upstream => Affinity::Downstream,
+            Affinity::Downstream => Affinity::Upstream,
+        };
+        let (here, there) = (self.home(at, side), self.home(at, other));
+        let apart = here.as_ref().map(|i| i.id) != there.as_ref().map(|i| i.id);
+        let leaves = strong.is_some_and(|d| {
+            !self.held && !self.stays_put && apart && self.runs(&here, at) != d && self.runs(&there, at) == d
+        });
+        if !leaves {
+            return match here {
+                Some(isolate) => self.buffer.insert_in(at, text, isolate.id),
+                None => self.buffer.insert(at, text),
+            }
+            .expect(done);
+        }
+        // Out of `here`, and the spaces at its end with it: taken out,
+        // and put back on the far side with the text.
+        let mut from = at;
+        if let (Affinity::Upstream, Some(left)) = (side, &here) {
+            if left.range.end == at {
+                let inside = self
+                    .buffer
+                    .read(left.range.start, at - left.range.start)
+                    .expect("an isolate is in the buffer")
+                    .text
+                    .to_string();
+                let kept = inside.trim_end_matches(' ').len();
+                // Not all of it: an isolate of nothing but spaces goes.
+                if kept > 0 {
+                    from = left.range.start + kept;
+                }
+            }
+        }
+        let spaces = " ".repeat(at - from);
+        if from < at {
+            self.buffer.replace(Range { start: from, end: at }, "").expect(done);
+        }
+        let all = format!("{spaces}{text}");
+        // `there` may have gone with the spaces' isolate; look again.
+        let there = if from < at { self.home(from, Affinity::Downstream) } else { there };
+        match there.filter(|i| i.range.start <= from && from <= i.range.end) {
+            Some(isolate) => self.buffer.insert_in(from, &all, isolate.id),
+            None => self.buffer.insert(from, &all),
+        }
+        .expect(done);
+        text.len()
     }
 
     /// Makes isolates of the text that has none and wants them: each
@@ -434,6 +699,31 @@ impl Editor {
             .expect("the whole buffer is in bounds")
             .text
             .to_string();
+        // An isolate is one paragraph's. One with a line end in it (Return
+        // pressed inside it) is made one for each line it's on.
+        for isolate in self.buffer.isolates() {
+            let inside = &text[isolate.range.clone()];
+            if !inside.contains('\n') {
+                continue;
+            }
+            let _ = self.buffer.remove_isolate(isolate.id);
+            let mut from = isolate.range.start;
+            for piece in inside.split('\n') {
+                // Not where its line now runs its way anyhow.
+                let line_from = text[..from].rfind('\n').map_or(0, |i| i + 1);
+                let line_to = text[from..].find('\n').map_or(text.len(), |i| from + i);
+                let runs = if bidi::base(&text[line_from..line_to]) % 2 == 1 {
+                    Direction::RightToLeft
+                } else {
+                    Direction::LeftToRight
+                };
+                if !piece.trim().is_empty() && runs != isolate.direction {
+                    let range = Range { start: from, end: from + piece.len() };
+                    let _ = self.buffer.mark_isolate(range, isolate.direction);
+                }
+                from += piece.len() + 1;
+            }
+        }
         let mut start = 0;
         for paragraph in text.split('\n') {
             let end = start + paragraph.len();
@@ -677,22 +967,268 @@ mod tests {
         // Loaded: the algorithm's stretches become isolates.
         let e = hebrew("abc אבג דהו def\nאבג abc\nplain");
         assert_eq!(isolated(&e), ["אבג דהו", "abc"]);
-        // Typed: a phrase is one isolate, however it's built up.
+        // Typed: a phrase is one isolate from its first letter on.
         let mut e = hebrew("say ");
         e.set_selection(r(4, 4));
         type_in(&mut e, "אבג");
         assert_eq!(isolated(&e), ["אבג"]);
         let id = e.buffer.isolates()[0].id;
+        // A space stays with the word it was typed after.
         type_in(&mut e, " ");
-        assert_eq!(isolated(&e), ["אבג"]);
-        type_in(&mut e, "דהו");
-        assert_eq!(isolated(&e), ["אבג דהו"]);
-        // The first word's isolate grew letter by letter; taking in the
-        // second made a new one.
-        assert_ne!(e.buffer.isolates()[0].id, id);
-        // English after it is outside.
-        type_in(&mut e, " end");
+        assert_eq!(isolated(&e), ["אבג "]);
+        type_in(&mut e, "דהו ");
+        assert_eq!(isolated(&e), ["אבג דהו "]);
+        // English leaves the phrase, and the space before it goes too.
+        type_in(&mut e, "end");
         assert_eq!((e.text(), isolated(&e)), ("say אבג דהו end", vec!["אבג דהו"]));
+        assert_eq!(e.buffer.isolates()[0].id, id);
+    }
+
+    #[test]
+    fn typing_never_sends_the_cursor_across_the_line() {
+        // An English paragraph. Hebrew is typed leftwards from where it
+        // starts; a space after it carries on leftwards.
+        let mut e = hebrew("say ");
+        e.set_selection(r(4, 4));
+        let x = |e: &Editor| e.caret_rect(e.caret()).x;
+        let start = x(&e);
+        type_in(&mut e, "א");
+        // The first letter is drawn at the cursor, and the cursor is on
+        // its left.
+        let after_one = x(&e);
+        assert_eq!(after_one, start);
+        type_in(&mut e, "בג");
+        assert_eq!(x(&e), start);
+        // Its right edge moved out as it grew; the cursor stayed.
+        assert!(e.caret_rect(Place::downstream(4)).x > start);
+        type_in(&mut e, " ");
+        // A space at a paragraph's end takes room for the cursor's sake:
+        // it steps on the way the Hebrew runs.
+        assert!(x(&e) < start, "{} then {}", start, x(&e));
+        let side = e.caret_side();
+        assert_eq!((side.direction, side.choice, side.held), (Direction::RightToLeft, true, false));
+        // English: it shows on the phrase's right, where English goes
+        // on, and the cursor is after it.
+        type_in(&mut e, "e");
+        assert_eq!(e.text(), "say אבג e");
+        assert_eq!(e.caret_side().direction, Direction::LeftToRight);
+        assert!(x(&e) > e.caret_rect(Place::downstream(4)).x);
+    }
+
+    #[test]
+    fn the_writer_can_hold_a_side() {
+        // At the end of a Hebrew phrase, English leaves it...
+        let mut e = hebrew("say אבג");
+        e.set_caret(Place::upstream(10));
+        assert_eq!(e.caret_side().direction, Direction::RightToLeft);
+        type_in(&mut e, " x");
+        assert_eq!(isolated(&e), ["אבג"]);
+        // ...unless the side's held: then it's part of the phrase, and
+        // set in it.
+        let mut e = hebrew("say אבג");
+        e.set_caret(Place::downstream(10));
+        assert_eq!(e.caret_side().direction, Direction::LeftToRight);
+        assert!(e.flip_side());
+        assert_eq!((e.caret(), e.caret_side().held), (Place::upstream(10), true));
+        assert_eq!(e.kept_in().map(|i| i.range), Some(4..10));
+        type_in(&mut e, " abc");
+        assert_eq!((e.text(), isolated(&e)), ("say אבג abc", vec!["אבג abc"]));
+        // Moving the cursor lets go.
+        e.set_caret(Place::downstream(4));
+        assert!(!e.caret_side().held);
+        // Outside held, Hebrew typed beside the phrase isn't in it.
+        let mut e = hebrew("say אבג");
+        e.set_caret(Place::upstream(10));
+        assert!(e.flip_side());
+        assert_eq!(e.caret(), Place::downstream(10));
+        type_in(&mut e, "ד");
+        assert_eq!(e.text(), "say אבגד");
+        assert_eq!(isolated(&e), ["אבג", "ד"]);
+        // Where there's one side, there's nothing to flip.
+        e.set_caret(Place::downstream(1));
+        assert!(!e.flip_side());
+    }
+
+    #[test]
+    fn a_cursor_that_stays_put() {
+        let mut e = hebrew("say ");
+        e.set_stays_put(true);
+        e.set_selection(r(4, 4));
+        let x = |e: &Editor| e.caret_rect(e.caret()).x;
+        let start = x(&e);
+        type_in(&mut e, "אבג ");
+        // A change of keyboard doesn't move it.
+        assert!(!e.face(Direction::LeftToRight));
+        // English goes in at the cursor: in the phrase, at its left end,
+        // where the cursor was. It runs rightwards from there, pushing
+        // the Hebrew along; the cursor is after it, still left of the
+        // Hebrew.
+        let before = x(&e);
+        assert!(before < start);
+        type_in(&mut e, "ab");
+        assert_eq!((e.text(), isolated(&e)), ("say אבג ab", vec!["אבג ab"]));
+        assert_eq!(e.caret_rect(Place::downstream(11)).x, start);
+        assert!(x(&e) > start && x(&e) < e.caret_rect(Place::downstream(4)).x);
+        // While it's in the phrase, the phrase is what's shown as holding
+        // it.
+        assert_eq!(e.kept_in().map(|i| &e.flat[i.range]), Some("אבג ab"));
+        // The writer steps out, and then it's English's side.
+        assert!(e.flip_side());
+        assert_eq!(e.kept_in(), None);
+        type_in(&mut e, " end");
+        assert_eq!((e.text(), isolated(&e)), ("say אבג ab end", vec!["אבג ab"]));
+        // Turned off, it's as before.
+        e.set_stays_put(false);
+        let mut e = hebrew("say אבג");
+        e.set_caret(Place::upstream(10));
+        type_in(&mut e, " x");
+        assert_eq!(isolated(&e), ["אבג"]);
+    }
+
+    #[test]
+    fn typing_over_text_goes_where_the_text_was() {
+        // The last Hebrew word, selected and typed over. דהו is 11..17.
+        let text = "say אבג דהו end";
+        let over = |e: &mut Editor, with: &str| {
+            e.set_selection(r(11, 17));
+            let selection = e.selection();
+            e.replace(selection, with);
+        };
+        // With a space and a digit: neither says a direction, and they
+        // stay in the phrase the word was in.
+        let mut e = hebrew(text);
+        over(&mut e, " 7");
+        assert_eq!((e.text(), isolated(&e)), ("say אבג  7 end", vec!["אבג  7"]));
+        // With Hebrew: in the phrase.
+        let mut e = hebrew(text);
+        over(&mut e, "זחט");
+        assert_eq!(isolated(&e), ["אבג זחט"]);
+        // With English: it leaves, as English typed there would.
+        let mut e = hebrew(text);
+        over(&mut e, "x");
+        assert_eq!((e.text(), isolated(&e)), ("say אבג x end", vec!["אבג"]));
+        // Unless the cursor stays put: then it's in the phrase too.
+        let mut e = hebrew(text);
+        e.set_stays_put(true);
+        over(&mut e, "x");
+        assert_eq!((e.text(), isolated(&e)), ("say אבג x end", vec!["אבג x"]));
+        // A whole phrase typed over is gone, and what replaces it is
+        // wherever the phrase was: here, in the English.
+        let mut e = hebrew(text);
+        e.set_selection(r(4, 17));
+        e.replace(r(4, 17), "7");
+        assert_eq!((e.text(), isolated(&e)), ("say 7 end", vec![]));
+        // Pasted at the cursor, text goes to the cursor's side like
+        // anything typed.
+        let mut e = hebrew(text);
+        e.set_caret(Place::upstream(17));
+        e.replace(r(17, 17), ", 12");
+        assert_eq!(isolated(&e), ["אבג דהו, 12"]);
+    }
+
+    fn reopened(e: &mut Editor, text: &str) -> Editor {
+        let inter =
+            Font::from_bytes(include_bytes!("../fonts/Inter-Regular.ttf").to_vec()).unwrap();
+        let noto =
+            Font::from_bytes(include_bytes!("../fonts/NotoSansHebrew-Regular.ttf").to_vec()).unwrap();
+        let history = e.history();
+        Editor::open(&history, "me", text, Arc::new(inter), vec![Arc::new(noto)], 17 * PT, 24 * PT, 300 * PT)
+    }
+
+    #[test]
+    fn a_history_keeps_what_the_characters_cant_say() {
+        // English held in a Hebrew phrase: nothing in the characters
+        // says it's in there.
+        let mut e = hebrew("say אבג");
+        e.set_stays_put(true);
+        e.set_caret(Place::upstream(10));
+        type_in(&mut e, " abc");
+        assert_eq!(isolated(&e), ["אבג abc"]);
+        let x = e.caret_rect(Place::downstream(11)).x;
+        // Made again from the text alone, the English is outside.
+        let plain = hebrew("say אבג abc");
+        assert_eq!(isolated(&plain), ["אבג"]);
+        assert_ne!(plain.caret_rect(Place::downstream(11)).x, x);
+        // Made again from its history, it's as it was left.
+        let text = e.text().to_string();
+        let mut back = reopened(&mut e, &text);
+        assert_eq!((back.text(), isolated(&back)), ("say אבג abc", vec!["אבג abc"]));
+        assert_eq!(back.buffer.isolates(), e.buffer.isolates());
+        assert_eq!(back.caret_rect(Place::downstream(11)).x, x);
+        // And it can be typed in, and kept again.
+        back.set_caret(Place::upstream(14));
+        back.flip_side();
+        back.flip_side();
+        type_in(&mut back, "d");
+        assert_eq!(isolated(&back), ["אבג abcd"]);
+        let text = back.text().to_string();
+        assert_eq!(isolated(&reopened(&mut back, &text)), ["אבג abcd"]);
+    }
+
+    #[test]
+    fn a_history_follows_text_changed_behind_its_back() {
+        let mut e = hebrew("say אבג");
+        e.set_stays_put(true);
+        e.set_caret(Place::upstream(10));
+        type_in(&mut e, " abc");
+        let id = e.buffer.isolates()[0].id;
+        // The text was edited somewhere that didn't have the history:
+        // a word in front, a letter in the phrase.
+        let back = reopened(&mut e, "do say אבdג abc now");
+        assert_eq!(back.text(), "do say אבdג abc now");
+        assert_eq!(isolated(&back), ["אבdג abc"]);
+        assert_eq!(back.buffer.isolates()[0].id, id);
+        // With no history at all, it's a new editor for the text.
+        let inter =
+            Font::from_bytes(include_bytes!("../fonts/Inter-Regular.ttf").to_vec()).unwrap();
+        let fresh = Editor::open(b"", "me", "say אבג", Arc::new(inter), vec![], 17 * PT, 24 * PT, 300 * PT);
+        assert_eq!((fresh.text(), isolated(&fresh)), ("say אבג", vec!["אבג"]));
+    }
+
+    #[test]
+    fn a_broken_line_is_no_choice_of_side() {
+        // Two places, one at the end of a line and one at the start of
+        // the next: nothing to do with direction.
+        let mut e = editor("aaaa-bbbb-cccc-dddd", 60);
+        let b = e.lines()[1].start;
+        e.set_caret(Place::upstream(b));
+        assert_ne!(e.caret_rect(Place::upstream(b)), e.caret_rect(Place::downstream(b)));
+        assert!(!e.caret_side().choice);
+        assert!(!e.flip_side());
+    }
+
+    #[test]
+    fn changing_keyboard_turns_the_cursor() {
+        let mut e = hebrew("say אבג");
+        // After the Hebrew, with it. A Latin keyboard comes up: the
+        // cursor goes to where Latin will show.
+        e.set_caret(Place::upstream(10));
+        let x = e.caret_rect(e.caret()).x;
+        assert!(e.face(Direction::LeftToRight));
+        assert_eq!(e.caret(), Place::downstream(10));
+        assert!(e.caret_rect(e.caret()).x > x);
+        // Back to Hebrew, and back it goes.
+        assert!(e.face(Direction::RightToLeft));
+        assert_eq!(e.caret(), Place::upstream(10));
+        // It's already facing that way: nothing to do. Nor if it's held.
+        assert!(!e.face(Direction::RightToLeft));
+        e.flip_side();
+        assert!(!e.face(Direction::RightToLeft));
+    }
+
+    #[test]
+    fn return_in_an_isolate_makes_two() {
+        let mut e = hebrew("say אבג דהו end");
+        assert_eq!(isolated(&e), ["אבג דהו"]);
+        // Between the two Hebrew words, after the space.
+        e.set_selection(r(11, 11));
+        type_in(&mut e, "\n");
+        assert_eq!(e.text(), "say אבג \nדהו end");
+        // The first line keeps its Hebrew as an isolate; the second
+        // starts with Hebrew, so it's a Hebrew paragraph, with "end" in
+        // it.
+        assert_eq!(isolated(&e), ["אבג ", "end"]);
+        assert!(e.buffer.isolates().iter().all(|i| !e.flat[i.range.clone()].contains('\n')));
     }
 
     #[test]
