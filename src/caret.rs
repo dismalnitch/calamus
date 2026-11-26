@@ -122,8 +122,14 @@ use mamre_rope::{Edge, Rope, Unit};
 
 use crate::units::{Heading, Offset};
 
+/// Which of an offset's two places, where it has two: the end of one line
+/// and the start of the next at a soft break, or (when right to left
+/// comes) either side of a change of direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Affinity {
+    /// With the text before the offset.
     Upstream,
+    /// With the text after it. Where an offset has one place, this is it.
     Downstream,
 }
 

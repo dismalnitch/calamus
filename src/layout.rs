@@ -585,7 +585,7 @@ fn is_private_use(c: char) -> bool {
 }
 
 /// Spaces that a line can break after, stretch and lose at a break.
-fn is_space(c: char) -> bool {
+pub(crate) fn is_space(c: char) -> bool {
     break_property(u32::from(c)) == BreakClass::Space
 }
 

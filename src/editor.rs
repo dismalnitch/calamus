@@ -24,7 +24,7 @@ use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::buffer::{Buffer, Edge, Unit};
-pub use crate::display::{Display, Line, Rect, Stop, StopIndex};
+pub use crate::display::{Affinity, Display, Line, Place, Rect, Stop, StopIndex};
 use crate::layout::Font;
 
 pub struct Editor {
@@ -39,6 +39,9 @@ pub struct Editor {
     byte_of_utf16: Vec<usize>,
     display: Display,
     selection: Range<usize>,
+    /// Which of its offset's places the cursor is at, while the selection
+    /// is empty.
+    affinity: Affinity,
     marked: Option<Range<usize>>,
     /// Every grapheme cluster boundary in the text, in order.
     boundaries: Vec<usize>,
@@ -63,6 +66,7 @@ impl Editor {
             byte_of_utf16: Vec::new(),
             display: Display::new(font, fallback, size, line_height, width),
             selection: Range { start: 0, end: 0 },
+            affinity: Affinity::Downstream,
             marked: None,
             boundaries: Vec::new(),
         };
@@ -151,9 +155,26 @@ impl Editor {
         self.selection
     }
 
+    /// Where the cursor is: the selection's end, and while the selection
+    /// is empty, which of that offset's places.
+    pub fn caret(&self) -> Place {
+        Place { offset: self.selection.end, affinity: self.affinity }
+    }
+
+    /// Put the cursor at `at` (moved back to a whole grapheme cluster),
+    /// selecting nothing.
+    pub fn set_caret(&mut self, at: Place) {
+        self.set_selection(Range { start: at.offset, end: at.offset });
+        self.affinity = at.affinity;
+    }
+
     /// Select `range`, widened to whole grapheme clusters: a selection never
-    /// starts or ends inside one.
+    /// starts or ends inside one. The cursor is downstream; [`set_caret`]
+    /// says otherwise.
+    ///
+    /// [`set_caret`]: Editor::set_caret
     pub fn set_selection(&mut self, range: Range<usize>) {
+        self.affinity = Affinity::Downstream;
         let len = self.len();
         let (a, b) = (
             range.start.min(range.end).min(len),
@@ -267,15 +288,10 @@ impl Editor {
         })
     }
 
-    /// The place `lines` lines up (negative) or down from `offset`, nearest
+    /// The place `lines` lines up (negative) or down from `at`, nearest
     /// `goal_x` (or the cursor's own x). `None` past the first or last line.
-    pub fn offset_by_lines(
-        &self,
-        offset: usize,
-        lines: isize,
-        goal_x: Option<i64>,
-    ) -> Option<usize> {
-        self.display.offset_by_lines(offset, lines, goal_x)
+    pub fn place_by_lines(&self, at: Place, lines: isize, goal_x: Option<i64>) -> Option<Place> {
+        self.display.place_by_lines(at, lines, goal_x)
     }
 
     // Geometry, from the display
@@ -285,14 +301,14 @@ impl Editor {
         &self.display
     }
 
-    /// Where the cursor stands at `offset`; see [`Display::caret_rect`].
-    pub fn caret_rect(&self, offset: usize) -> Rect {
-        self.display.caret_rect(offset)
+    /// Where the cursor stands at `at`; see [`Display::caret_rect`].
+    pub fn caret_rect(&self, at: Place) -> Rect {
+        self.display.caret_rect(at)
     }
 
-    /// The place under (`x`, `y`); see [`Display::closest_offset`].
-    pub fn closest_offset(&self, x: i64, y: i64) -> usize {
-        self.display.closest_offset(x, y)
+    /// The place under (`x`, `y`); see [`Display::closest_place`].
+    pub fn closest_place(&self, x: i64, y: i64) -> Place {
+        self.display.closest_place(x, y)
     }
 
     /// The rectangles covering `range`; see [`Display::selection_rects`].
@@ -367,6 +383,8 @@ impl Editor {
             .replace(range, &text)
             .expect("the range is clamped to the buffer and to whole characters");
         self.layout();
+        // What was typed is before the cursor; what comes next goes after.
+        self.affinity = Affinity::Downstream;
         (range.start, added)
     }
 
@@ -555,11 +573,13 @@ mod tests {
         // paragraph at a time; a cluster never spans a line end, so they
         // agree.
         let e = editor("naïve e\u{301} 😀 office\n\u{301}x\n\nlast 👨‍👩‍👧", 80);
-        let stops: Vec<usize> = e
+        let mut stops: Vec<usize> = e
             .lines()
             .iter()
             .flat_map(|l| l.stops.iter().map(|s| s.offset))
             .collect();
+        // An offset with two places is two stops.
+        stops.dedup();
         assert_eq!(stops, e.boundaries);
     }
 }
