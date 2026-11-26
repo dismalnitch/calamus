@@ -14,7 +14,7 @@ use std::{fmt, range::Range};
 use mamre_rope::Rope;
 pub use mamre_rope::{Edge, Unit};
 use mamre_text::Text;
-pub use mamre_text::{Direction, Isolate, IsolateId};
+pub use mamre_text::{Direction, Isolate, IsolateId, Kind, Paragraph, Section, SectionId};
 
 use crate::units::{Heading, Offset};
 
@@ -52,6 +52,12 @@ pub enum BufferError {
     NoSuchIsolate,
     /// The range takes part of an isolate and not the rest.
     CrossesIsolate,
+    /// There's no such section now: unmarked, or its first character
+    /// deleted.
+    NoSuchSection,
+    /// The paragraph has no line break before it to carry a kind: it's
+    /// the text before the first one.
+    NoBreak,
 }
 
 impl fmt::Display for BufferError {
@@ -71,6 +77,8 @@ impl fmt::Display for BufferError {
             }
             BufferError::NoSuchIsolate => write!(f, "no such isolate there"),
             BufferError::CrossesIsolate => write!(f, "the range takes part of an isolate"),
+            BufferError::NoSuchSection => write!(f, "no such section"),
+            BufferError::NoBreak => write!(f, "the paragraph has no line break before it"),
         }
     }
 }
@@ -271,6 +279,66 @@ impl Buffer {
     pub fn insert_in(&mut self, at: usize, text: &str, id: IsolateId) -> Result<usize, BufferError> {
         self.check_offset(at)?;
         self.text.insert_in(at, text, id).map(|_| text.len()).map_err(|_| BufferError::NoSuchIsolate)
+    }
+
+    /// Every paragraph, in order, with what it is. A paragraph's kind is
+    /// a mark on the line break that starts it, so the text before the
+    /// first break is always plain.
+    pub fn paragraphs(&self) -> Vec<Paragraph> {
+        self.text.paragraphs()
+    }
+
+    /// What the paragraph a cursor at byte `at` is in is.
+    pub fn kind_at(&self, at: usize) -> Kind {
+        self.text.kind_at(at)
+    }
+
+    /// Makes the paragraph a cursor at byte `at` is in a `kind`.
+    pub fn set_kind(&mut self, at: usize, kind: Kind) -> Result<(), BufferError> {
+        self.check_offset(at)?;
+        self.text.set_kind(at, kind).map(|_| ()).map_err(|_| BufferError::NoBreak)
+    }
+
+    /// The sections the text shows, in order: each a mark on the
+    /// character that starts it, with a level (1 the outermost).
+    pub fn sections(&self) -> Vec<Section> {
+        self.text.sections()
+    }
+
+    /// Makes the character at byte `at` start a section at `level` (0: no
+    /// section). Its id is the same through every edit, move and merge.
+    pub fn mark_section(&mut self, at: usize, level: u8) -> Result<SectionId, BufferError> {
+        let len = self.len();
+        if at >= len {
+            return Err(BufferError::OutOfBounds { at, len });
+        }
+        self.check_boundary(at)?;
+        self.text.mark_section(at, level).map(|(id, _)| id).map_err(|_| BufferError::OutOfBounds { at, len })
+    }
+
+    /// Where section `id` runs: from its first character to the next
+    /// section at its level or above, or the end.
+    pub fn section_range(&self, id: SectionId) -> Option<Range<usize>> {
+        self.text.section_range(id).map(|r| Range { start: r.start, end: r.end })
+    }
+
+    /// Moves section `id`, subsections and all, to byte `to` (an offset
+    /// before the move). To inside itself, or where it is, does nothing.
+    pub fn move_section(&mut self, id: SectionId, to: usize) -> Result<(), BufferError> {
+        let range = self.section_range(id).ok_or(BufferError::NoSuchSection)?;
+        self.move_text(range, to)
+    }
+
+    /// Moves the text in `range` to byte `to` (an offset before the
+    /// move): the same characters somewhere else, so sections and
+    /// isolates in them go along.
+    pub fn move_text(&mut self, range: Range<usize>, to: usize) -> Result<(), BufferError> {
+        self.check_range(&range)?;
+        self.check_offset(to)?;
+        self.text
+            .move_text(range.start..range.end, to)
+            .map(|_| ())
+            .map_err(|_| BufferError::RangeOutOfBounds { at: range.start, end: range.end, len: self.len() })
     }
 
     fn check_range(&self, range: &Range<usize>) -> Result<(), BufferError> {
