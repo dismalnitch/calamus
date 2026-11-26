@@ -109,13 +109,10 @@ impl Editor {
     /// cursor stays where it was if it can, and marked text is forgotten.
     pub fn set_text(&mut self, text: &str) {
         let selection = self.selection;
-        self.splice(
-            Range {
-                start: 0,
-                end: self.len(),
-            },
-            text,
-        );
+        // Not a retyping of the whole text: what's the same keeps its
+        // place in the buffer's history, and so its isolates.
+        self.buffer.reconcile(&line_ends(text));
+        self.layout();
         self.marked = None;
         self.set_selection(selection);
     }

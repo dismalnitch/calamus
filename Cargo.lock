@@ -26,6 +26,7 @@ version = "0.1.0"
 dependencies = [
  "demerits",
  "mamre-rope",
+ "mamre-text",
  "rustybuzz",
  "unicode-linebreak",
  "unicode-segmentation",
@@ -60,20 +61,38 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 [[package]]
 name = "mamre"
 version = "0.1.0"
-source = "git+https://github.com/dismalnitch/mamre?rev=a14533f2#a14533f22ed4329a6e45491c64cda3c4fea24433"
+source = "git+https://github.com/dismalnitch/mamre?rev=3cd0593#3cd0593ab234c5772d96c3dc7b36313daf8cfb85"
 dependencies = [
  "arrayvec",
 ]
 
 [[package]]
+name = "mamre-egg-walker"
+version = "0.1.0"
+source = "git+https://github.com/dismalnitch/mamre?rev=3cd0593#3cd0593ab234c5772d96c3dc7b36313daf8cfb85"
+dependencies = [
+ "mamre",
+]
+
+[[package]]
 name = "mamre-rope"
 version = "0.1.0"
-source = "git+https://github.com/dismalnitch/mamre?rev=a14533f2#a14533f22ed4329a6e45491c64cda3c4fea24433"
+source = "git+https://github.com/dismalnitch/mamre?rev=3cd0593#3cd0593ab234c5772d96c3dc7b36313daf8cfb85"
 dependencies = [
  "arrayvec",
  "mamre",
  "unicode-properties",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "mamre-text"
+version = "0.1.0"
+source = "git+https://github.com/dismalnitch/mamre?rev=3cd0593#3cd0593ab234c5772d96c3dc7b36313daf8cfb85"
+dependencies = [
+ "mamre",
+ "mamre-egg-walker",
+ "mamre-rope",
 ]
 
 [[package]]
