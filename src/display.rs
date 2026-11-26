@@ -462,7 +462,7 @@ impl Display {
                 len: text.len(),
                 style,
             }];
-            let set = set_paragraph_bidi(text, &runs, &paragraph_style, &[self.width], base, &levels, true);
+            let set = set_paragraph_bidi(text, &runs, &paragraph_style, &[self.width], base, &levels, true, true);
             let count = set.lines.len();
             for (i, line) in set.lines.iter().enumerate() {
                 let last = i + 1 == count;

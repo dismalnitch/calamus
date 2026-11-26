@@ -336,7 +336,7 @@ pub struct Glyph {
 /// If `line_widths` is empty, if the runs don't add up to the text, or if
 /// one ends inside a character.
 pub fn set_paragraph(text: &str, runs: &[Run], style: &Style, line_widths: &[i64]) -> Paragraph {
-    set_paragraph_bidi(text, runs, style, line_widths, 0, &[], false)
+    set_paragraph_bidi(text, runs, style, line_widths, 0, &[], false, false)
 }
 
 /// [`set_paragraph`], for text that doesn't all run left to right.
@@ -368,6 +368,7 @@ pub fn set_paragraph_bidi(
     base: u8,
     levels: &[u8],
     keep_spaces: bool,
+    break_words: bool,
 ) -> Paragraph {
     assert!(levels.is_empty() || levels.len() == text.len(), "a level for every byte, or none");
     assert!(!line_widths.is_empty(), "no line widths: every line needs one");
@@ -383,7 +384,12 @@ pub fn set_paragraph_bidi(
     }
     assert!(end == text.len(), "the runs hold {end} of the text's {} bytes", text.len());
 
-    let (items, spans, glyphs, parts) = itemize(text, runs, &ends, base, levels, keep_spaces);
+    // A word wider than the narrowest line can't fit on one whole. Set
+    // as a page is, it has a line to itself and runs past the edge; an
+    // editor asks for it broken (`break_words`), so nothing typed is ever
+    // out of sight.
+    let limit = if break_words { line_widths.iter().copied().min().unwrap_or(0) } else { 0 };
+    let (items, spans, glyphs, parts) = itemize(text, runs, &ends, base, levels, keep_spaces, limit);
     let breaks = match style.align {
         Align::Ragged => demerits::ragged(&items, line_widths),
         Align::Justified => match demerits::break_lines(&items, line_widths, &demerits::Params::default()) {
@@ -670,6 +676,7 @@ fn itemize(
     base: u8,
     levels: &[u8],
     keep_spaces: bool,
+    limit: i64,
 ) -> (Vec<Item>, Vec<Span>, Vec<Shaped>, Vec<usize>) {
     let mut shaper = Shaper::new(runs, ends, base, levels);
     let mut items = Vec::new();
@@ -694,11 +701,33 @@ fn itemize(
         let segment = &text[start..end];
         let space_end = start + segment.trim_end_matches(is_line_end).len();
         let content_end = start + text[start..space_end].trim_end_matches(is_space).len();
+        let (glyphs_before, parts_before) = (shaper.glyphs.len(), shaper.parts.len());
         let content = shaper.shape(text, start..content_end);
         let width = |glyphs: &[Shaped], range: &Range<usize>| glyphs[range.clone()].iter().map(|g| g.advance).sum();
 
         if content_end > start {
-            push(Item::Box { width: width(&shaper.glyphs, &content) }, content, content_end);
+            let whole: i64 = width(&shaper.glyphs, &content);
+            if limit > 0 && whole > limit {
+                // Wider than a line: it may break between any two of its
+                // characters (CSS's `overflow-wrap: anywhere`), at a cost,
+                // so it's only done to what can't fit. Each is shaped on
+                // its own, as anything a line can break between is.
+                shaper.glyphs.truncate(glyphs_before);
+                shaper.parts.truncate(parts_before);
+                let mut at = start;
+                for cluster in text[start..content_end].graphemes(true) {
+                    if at > start {
+                        let g = shaper.glyphs.len();
+                        push(Item::Penalty { width: 0, cost: 1000, flagged: false }, g..g, at);
+                    }
+                    let end = at + cluster.len();
+                    let shaped = shaper.shape(text, at..end);
+                    push(Item::Box { width: width(&shaper.glyphs, &shaped) }, shaped, end);
+                    at = end;
+                }
+            } else {
+                push(Item::Box { width: whole }, content, content_end);
+            }
         }
         match opportunity {
             BreakOpportunity::Mandatory => {

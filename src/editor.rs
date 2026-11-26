@@ -1175,6 +1175,28 @@ mod tests {
     }
 
     #[test]
+    fn a_word_wider_than_the_page_breaks_inside_itself() {
+        let long = "asdf".repeat(16);
+        for document in [false, true] {
+            let mut e = editor(&format!("short {long} words"), 200);
+            if document {
+                e.set_document(true);
+                e.set_kind_at(1, Kind::Heading(1));
+            }
+            assert!(e.lines().len() > 2);
+            assert!(e.lines().iter().all(|l| l.width <= 200 * PT), "no line runs past the page");
+            // Every place is still on the page, and the text is whole.
+            let last = e.len();
+            assert!(e.caret_rect(Place::downstream(last)).x <= 200 * PT);
+            assert!(e.text().ends_with(" words"));
+        }
+        // A word that fits is never broken.
+        let e = editor("the quick brown fox jumps over the lazy dog", 120);
+        let starts: Vec<usize> = e.lines().iter().map(|l| l.start).collect();
+        assert!(starts[1..].iter().all(|&at| e.text()[..at].ends_with(' ')), "lines start after a space");
+    }
+
+    #[test]
     fn a_section_moves_with_its_subsections_and_keeps_its_mark() {
         let text = "One\none's text\nSub\nsub's text\nTwo\ntwo's text\n";
         let mut e = editor(text, 300);
