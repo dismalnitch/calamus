@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tolle lege</title>
+<style>
+html{-webkit-text-size-adjust:none;text-size-adjust:none}
+body{margin:0;background:#fbfaf7;color:#1c1b19;font:14px/1.4 system-ui,sans-serif}
+header{display:flex;flex-wrap:wrap;gap:8px 20px;align-items:center;padding:12px 16px;border-bottom:1px solid #e3e0d8}
+header label{display:flex;gap:6px;align-items:center}
+#note{margin-left:auto;font-variant-numeric:tabular-nums;color:#6b675e}
+main{display:flex;flex-wrap:wrap;gap:24px;padding:24px 16px}
+textarea{flex:1 1 280px;min-height:240px;padding:12px;border:1px solid #d6d2c8;border-radius:6px;background:#fff;color:inherit;font:inherit}
+/* Drag the corner: the column is set again at every width. */
+#column{flex:0 1 auto;width:340px;max-width:100%;min-width:80px;box-sizing:border-box;padding:24px;resize:horizontal;overflow:hidden;background:#fff;border:1px solid #d6d2c8;border-radius:6px}
+/* The rules the typesetter's lines need (calamus::html::STYLE). */
+.set{position:relative}
+.set p{position:absolute;left:0;width:100%;margin:0;font-size:0;line-height:0}
+.set p>span{display:inline-block;width:100%;vertical-align:top;white-space:pre;
+font-kerning:normal;font-variant-ligatures:normal;font-synthesis:none;
+font-optical-sizing:none;letter-spacing:0;word-spacing:0}
+.set i{display:inline-block;width:0}
+.set s{display:inline-block;white-space:pre;text-decoration:none}
+@media (prefers-color-scheme: dark){
+body{background:#191816;color:#eceae4}
+header{border-color:#34322d}
+textarea,#column{background:#22211e;border-color:#3d3a34}
+#note{color:#a19d92}
+}
+</style>
+</head>
+<body>
+<header>
+<label>Size <input id="size" type="range" min="8" max="28" value="13"></label>
+<label><input id="justified" type="checkbox" checked> Justified</label>
+<span id="note"></span>
+</header>
+<main>
+<textarea id="text" spellcheck="false">I heard from a neighbouring house a voice, as of boy or girl, I know not, chanting, and oft repeating, “Take up and read; Take up and read.” Instantly, my countenance altered, I began to think most intently whether children were wont in any kind of play to sing such words: nor could I remember ever to have heard the like.
+So checking the torrent of my tears, I arose; interpreting it to be no other than a command from God to open the book, and read the first chapter I should find.</textarea>
+<div id="column"><div id="lines"></div></div>
+</main>
+<script type="module">
+import init, { Typesetter } from './pkg/calamus_web.js';
+
+const [, bytes] = await Promise.all([
+  init(),
+  fetch('./pkg/Inter-Regular.ttf').then((r) => r.arrayBuffer()),
+]);
+const typesetter = new Typesetter(new Uint8Array(bytes));
+
+// The same font for the browser to paint with, under the family the lines
+// name, with the ascent and descent the typesetter set by.
+const percent = (n) => `${n * 100}%`;
+const face = new FontFace('f0', bytes, {
+  ascentOverride: percent(typesetter.ascent()),
+  descentOverride: percent(typesetter.descent()),
+  lineGapOverride: '0%',
+});
+document.fonts.add(await face.load());
+
+const $ = (id) => document.getElementById(id);
+const PT_PER_PX = 0.75;
+
+function set() {
+  const width = $('lines').clientWidth * PT_PER_PX;
+  if (width <= 0) return;
+  const size = Number($('size').value);
+  const start = performance.now();
+  $('lines').innerHTML = typesetter.set($('text').value, width, size, Math.round(size * 1.4), $('justified').checked);
+  const lines = $('lines').querySelectorAll('.set p>span').length;
+  $('note').textContent = `${lines} lines, ${width.toFixed(1)} pt wide, set in ${(performance.now() - start).toFixed(1)} ms`;
+}
+
+for (const id of ['text', 'size', 'justified']) $(id).addEventListener('input', set);
+new ResizeObserver(set).observe($('column'));
+set();
+</script>
+</body>
+</html>

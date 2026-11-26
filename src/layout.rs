@@ -134,6 +134,18 @@ impl Font {
         self
     }
 
+    /// The font file's bytes, as handed over.
+    pub(crate) fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// The font's ascent and descent as fractions of its em, descent
+    /// positive: what [`TextStyle::line_height`] is centred around.
+    pub(crate) fn ascent_descent(&self) -> (f64, f64) {
+        let em = f64::from(self.units_per_em);
+        (f64::from(self.ascender) / em, -f64::from(self.descender) / em)
+    }
+
     fn face(&self) -> rustybuzz::Face<'_> {
         rustybuzz::Face::from_slice(&self.data, self.index).expect("checked when the font was loaded")
     }
@@ -209,12 +221,12 @@ pub struct TextStyle<'a> {
 
 impl<'a> TextStyle<'a> {
     /// Font `i` of this style: 0 is `font`, 1 the first fallback, and so on.
-    fn font_at(&self, i: usize) -> &'a Font {
+    pub(crate) fn font_at(&self, i: usize) -> &'a Font {
         if i == 0 { self.font } else { self.fallback[i - 1] }
     }
 
     /// `font`, then the fallback fonts.
-    fn fonts(&self) -> impl Iterator<Item = &'a Font> + use<'a> {
+    pub(crate) fn fonts(&self) -> impl Iterator<Item = &'a Font> + use<'a> {
         std::iter::once(self.font).chain(self.fallback.iter().copied())
     }
 
@@ -228,7 +240,7 @@ impl<'a> TextStyle<'a> {
 
     /// The same, for the glyphs set in `font`, one of this style's fonts: in
     /// CSS too, a fallback font's ascent and descent are its own.
-    fn extent_in(&self, font: &Font) -> (i64, i64) {
+    pub(crate) fn extent_in(&self, font: &Font) -> (i64, i64) {
         let ascent = font.scale(font.ascender, self.size);
         let descent = -font.scale(font.descender, self.size);
         let above = (self.line_height - (ascent + descent)).div_euclid(2) + ascent;
@@ -590,7 +602,7 @@ pub(crate) fn is_space(c: char) -> bool {
 }
 
 /// Line ends: a forced break, taking no room.
-fn is_line_end(c: char) -> bool {
+pub(crate) fn is_line_end(c: char) -> bool {
     matches!(
         break_property(u32::from(c)),
         BreakClass::Mandatory | BreakClass::CarriageReturn | BreakClass::LineFeed | BreakClass::NextLine

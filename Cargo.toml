@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+base64 = "0.23.1"
 demerits = { git = "https://github.com/Ganderworks/demerits", rev = "d555ac9", version = "0.1.0" }
 mamre-rope = { git = "https://github.com/dismalnitch/mamre", rev = "a14533f2", version = "0.1.0" }
 rustybuzz = "0.20.1"
@@ -14,3 +15,6 @@ unicode-segmentation = "1.13.3"
 # and test builds.
 [profile.dev.package."*"]
 opt-level = 3
+
+[workspace]
+members = ["web"]
