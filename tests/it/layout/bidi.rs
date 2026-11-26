@@ -24,7 +24,7 @@ fn set(text: &str, isolates: &[Stretch], width: i64) -> Paragraph {
     let levels = bidi::levels(text, isolates);
     let runs = [Run { len: text.len(), style: body() }];
     let style = Style { strut: body(), align: Align::Ragged };
-    set_paragraph_bidi(text, &runs, &style, &[width], bidi::base(text), &levels)
+    set_paragraph_bidi(text, &runs, &style, &[width], bidi::base(text), &levels, false)
 }
 
 fn line(text: &str, isolates: &[Stretch]) -> Line {

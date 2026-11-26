@@ -1001,10 +1001,13 @@ mod tests {
         assert_eq!(x(&e), start);
         // Its right edge moved out as it grew; the cursor stayed.
         assert!(e.caret_rect(Place::downstream(4)).x > start);
+        let right = e.caret_rect(Place::downstream(4)).x;
         type_in(&mut e, " ");
-        // A space at a paragraph's end takes room for the cursor's sake:
-        // it steps on the way the Hebrew runs.
-        assert!(x(&e) < start, "{} then {}", start, x(&e));
+        // A space is more of the phrase: it goes in at the cursor, on the
+        // Hebrew's left, and the Hebrew moves over for it. The cursor
+        // hasn't moved, and it isn't on top of anything.
+        assert_eq!(x(&e), start);
+        assert!(e.caret_rect(Place::downstream(4)).x > right);
         let side = e.caret_side();
         assert_eq!((side.direction, side.choice, side.held), (Direction::RightToLeft, true, false));
         // English: it shows on the phrase's right, where English goes
@@ -1063,8 +1066,7 @@ mod tests {
         // where the cursor was. It runs rightwards from there, pushing
         // the Hebrew along; the cursor is after it, still left of the
         // Hebrew.
-        let before = x(&e);
-        assert!(before < start);
+        assert_eq!(x(&e), start);
         type_in(&mut e, "ab");
         assert_eq!((e.text(), isolated(&e)), ("say אבג ab", vec!["אבג ab"]));
         assert_eq!(e.caret_rect(Place::downstream(11)).x, start);

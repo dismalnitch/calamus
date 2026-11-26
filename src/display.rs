@@ -30,9 +30,9 @@
 //! - The whole text is set again on every change, paragraph by paragraph.
 //!   No cache, no incremental layout.
 //! - One font and its fallbacks, ragged, no styles.
-//! - Spaces before a paragraph's end get a space's width each for the
-//!   cursor's sake, though the typesetter gives them none. Spaces at a soft
-//!   break still take no room: the cursor goes to the next line.
+//! - Spaces before a paragraph's end are set like any text, so one just
+//!   typed shows where its text puts it. Spaces at a soft break still
+//!   take no room: the cursor goes to the next line.
 
 use std::range::Range;
 use std::sync::Arc;
@@ -42,7 +42,7 @@ use unicode_segmentation::UnicodeSegmentation;
 pub use crate::caret::Affinity;
 use crate::bidi::{self, Stretch};
 use crate::buffer::Isolate;
-use crate::layout::{Align, Font, Glyph, Run, Style, TextStyle, is_space, set_paragraph, set_paragraph_bidi};
+use crate::layout::{Align, Font, Glyph, Run, Style, TextStyle, is_space, set_paragraph_bidi};
 
 /// A rectangle in scaled points, from the top-left of the text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -373,16 +373,6 @@ impl Display {
             strut: style,
             align: Align::Ragged,
         };
-        // How wide a space is, measured as a no-break space, which the
-        // typesetter keeps.
-        let space = {
-            let probe = "\u{a0}";
-            let runs = [Run {
-                len: probe.len(),
-                style,
-            }];
-            set_paragraph(probe, &runs, &paragraph_style, &[i64::MAX / 4]).lines[0].width
-        };
         let mut lines = Vec::new();
         let mut top = 0i64;
         let mut start = 0usize;
@@ -410,7 +400,7 @@ impl Display {
                 len: text.len(),
                 style,
             }];
-            let set = set_paragraph_bidi(text, &runs, &paragraph_style, &[self.width], base, &levels);
+            let set = set_paragraph_bidi(text, &runs, &paragraph_style, &[self.width], base, &levels, true);
             let count = set.lines.len();
             for (i, line) in set.lines.iter().enumerate() {
                 let last = i + 1 == count;
@@ -426,16 +416,16 @@ impl Display {
                             && (b < line.text.end || (ends_here && b == line.text.end))
                     })
                     .collect();
-                // Where what's drawn ends: the spaces after it have no
-                // glyphs.
-                let drawn = line.text.start + text[line.text.start..line.text.end].trim_end_matches(is_space).len();
-                // At a paragraph's end, the typesetter gives those spaces
-                // no room either, so every stop among them would sit on
-                // the text's end: a space typed there, or deleted,
-                // wouldn't move the cursor. Step past each one.
-                let step = if last { space } else { 0 };
+                // Where what's drawn ends. A line broken at spaces doesn't
+                // draw them. A paragraph's last line draws everything: the
+                // spaces at its end are kept, so one just typed shows.
+                let drawn = if last {
+                    line.text.end
+                } else {
+                    line.text.start + text[line.text.start..line.text.end].trim_end_matches(is_space).len()
+                };
                 let (stops, visual) =
-                    line_stops(&on_line, drawn, &line.glyphs, &levels, base, self.width, step, last);
+                    line_stops(&on_line, drawn, &line.glyphs, &levels, base, self.width);
                 lines.push(Line {
                     top: top + line.top,
                     height: line.height,
@@ -528,10 +518,11 @@ fn extent(line: &Line) -> (i64, i64) {
 /// begins, that offset has both places: two stops, unless they're at the
 /// same x.
 ///
-/// Past `drawn` there's nothing drawn: each boundary there steps `step`
-/// further on, the way its level runs. `ends` says the paragraph ends on
-/// this line.
-#[allow(clippy::too_many_arguments)]
+/// Past `drawn` there's nothing drawn (the spaces a line broke at): each
+/// boundary there is where the text before it ends. And the paragraph's
+/// own end is a place at its own level: after Hebrew that ends an English
+/// paragraph, the end is both the Hebrew's left edge and, on its right,
+/// where English goes on.
 fn line_stops(
     boundaries: &[usize],
     drawn: usize,
@@ -539,8 +530,6 @@ fn line_stops(
     levels: &[u8],
     base: u8,
     width: i64,
-    step: i64,
-    ends: bool,
 ) -> (Vec<Stop>, Vec<usize>) {
     let level_at = |b: usize| levels.get(b).copied().unwrap_or(base);
     let mut stops: Vec<Stop> = Vec::new();
@@ -618,28 +607,21 @@ fn line_stops(
         Some(s) if follows => s.x,
         _ => if rtl { left } else { right },
     };
-    // The first of them is at `from` unless that's the text's own end.
-    let mut n = i64::from(follows);
     for &offset in boundaries {
         if offset < drawn || (offset == drawn && follows) {
             continue;
         }
-        let x = if rtl { from - n * step } else { from + n * step };
-        n += 1;
-        let stop = Stop { offset, x };
+        let stop = Stop { offset, x: from };
         if stops.last() != Some(&stop) {
             stops.push(stop);
-            keys.push((from.min(x), rtl));
+            keys.push((from, rtl));
         }
     }
-    // A paragraph ends at its own level. If what's last on its last line
-    // runs the other way (spaces typed inside an isolate), its end has a
-    // second place: where the paragraph itself goes on.
-    let para_rtl = base % 2 == 1;
-    if let Some(&offset) = boundaries.last().filter(|&&b| ends && b > drawn && rtl != para_rtl) {
-        let x = if para_rtl { left } else { right };
-        stops.push(Stop { offset, x });
-        keys.push((x, para_rtl));
+    // Nothing the cursor can stand at is off the page: text too long to
+    // break (spaces typed on and on, a word wider than the line) runs
+    // out past the edge, and the cursor waits at it.
+    for stop in &mut stops {
+        stop.x = stop.x.clamp(0, width.max(0));
     }
     // On the page: by x; at one x, the stretch further left first; in one
     // stretch (clusters with no width), the way it runs.
@@ -1003,6 +985,50 @@ mod tests {
         let kept = hebrew(text, &[(4..11, crate::buffer::Direction::RightToLeft)], 300);
         assert!(x(&kept, 9) < x(&kept, 6));
         assert!(kept.caret_rect(up(9)).x <= x(&kept, 6));
+    }
+
+    #[test]
+    fn spaces_at_the_end_sit_where_their_text_puts_them() {
+        // English typed after Hebrew in a Hebrew paragraph, then spaces.
+        // אבג is 0..6; abc 6..9; the spaces from 9.
+        let d = hebrew("אבגabc", &[(6..9, crate::buffer::Direction::LeftToRight)], 300);
+        // The Hebrew's left edge is its end; the English runs up to it.
+        let hebrew_left = d.caret_rect(up(6)).x;
+        let english_left = d.caret_rect(down(6)).x;
+        assert!(english_left < hebrew_left);
+        assert_eq!(d.caret_rect(up(9)).x, hebrew_left, "the English ends against the Hebrew");
+        // With two spaces in the English's isolate: they're between the
+        // word and the Hebrew, the word has moved left for them, and the
+        // cursor after them is still against the Hebrew, not in it.
+        let spaced = hebrew("אבגabc  ", &[(6..11, crate::buffer::Direction::LeftToRight)], 300);
+        let x = |o| spaced.caret_rect(up(o)).x;
+        assert_eq!(x(11), hebrew_left);
+        assert!(x(9) < x(10) && x(10) < x(11));
+        assert!(spaced.caret_rect(down(6)).x < english_left);
+        // The Hebrew hasn't moved.
+        assert_eq!(spaced.caret_rect(down(0)).x, d.caret_rect(down(0)).x);
+    }
+
+    #[test]
+    fn the_cursor_never_leaves_the_page() {
+        // Spaces typed on and on: they can't break from the word, so the
+        // line runs out past the edge. The cursor stops at it.
+        let text = format!("word{}", " ".repeat(400));
+        let d = display(&text, 120);
+        for line in d.lines() {
+            for s in &line.stops {
+                assert!((0..=120 * PT).contains(&s.x), "{}", s.x);
+            }
+        }
+        assert_eq!(d.caret_rect(down(text.len())).x, 120 * PT);
+        // And in a Hebrew paragraph, at the left edge.
+        let text = format!("אבג{}", " ".repeat(400));
+        let d = hebrew(&text, &[], 120);
+        for line in d.lines() {
+            for s in &line.stops {
+                assert!((0..=120 * PT).contains(&s.x), "{}", s.x);
+            }
+        }
     }
 
     #[test]

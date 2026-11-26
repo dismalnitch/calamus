@@ -336,7 +336,7 @@ pub struct Glyph {
 /// If `line_widths` is empty, if the runs don't add up to the text, or if
 /// one ends inside a character.
 pub fn set_paragraph(text: &str, runs: &[Run], style: &Style, line_widths: &[i64]) -> Paragraph {
-    set_paragraph_bidi(text, runs, style, line_widths, 0, &[])
+    set_paragraph_bidi(text, runs, style, line_widths, 0, &[], false)
 }
 
 /// [`set_paragraph`], for text that doesn't all run left to right.
@@ -350,6 +350,12 @@ pub fn set_paragraph(text: &str, runs: &[Run], style: &Style, line_widths: &[i64
 /// algorithm's rule L2). A paragraph that runs right to left and isn't
 /// justified is set against the right edge.
 ///
+/// `keep_spaces` gives the spaces before the paragraph's end the room
+/// they'd have anywhere else, where a finished page gives them none. An
+/// editor wants them: a space just typed has to show, and to sit where
+/// its text puts it (after an English word in a Hebrew paragraph, between
+/// the word and the Hebrew).
+///
 /// # Panics
 ///
 /// As [`set_paragraph`], and if `levels` is neither empty nor as long as
@@ -361,6 +367,7 @@ pub fn set_paragraph_bidi(
     line_widths: &[i64],
     base: u8,
     levels: &[u8],
+    keep_spaces: bool,
 ) -> Paragraph {
     assert!(levels.is_empty() || levels.len() == text.len(), "a level for every byte, or none");
     assert!(!line_widths.is_empty(), "no line widths: every line needs one");
@@ -376,7 +383,7 @@ pub fn set_paragraph_bidi(
     }
     assert!(end == text.len(), "the runs hold {end} of the text's {} bytes", text.len());
 
-    let (items, spans, glyphs, parts) = itemize(text, runs, &ends, base, levels);
+    let (items, spans, glyphs, parts) = itemize(text, runs, &ends, base, levels, keep_spaces);
     let breaks = match style.align {
         Align::Ragged => demerits::ragged(&items, line_widths),
         Align::Justified => match demerits::break_lines(&items, line_widths, &demerits::Params::default()) {
@@ -662,6 +669,7 @@ fn itemize(
     ends: &[usize],
     base: u8,
     levels: &[u8],
+    keep_spaces: bool,
 ) -> (Vec<Item>, Vec<Span>, Vec<Shaped>, Vec<usize>) {
     let mut shaper = Shaper::new(runs, ends, base, levels);
     let mut items = Vec::new();
@@ -695,7 +703,13 @@ fn itemize(
         match opportunity {
             BreakOpportunity::Mandatory => {
                 // Spaces before a line end take no room, and the line end
-                // itself is never drawn.
+                // itself is never drawn. Kept, the spaces are part of the
+                // line like any text: they can't stretch, or be broken
+                // from what they follow.
+                if keep_spaces && space_end > content_end {
+                    let spaces = shaper.shape(text, content_end..space_end);
+                    push(Item::Box { width: width(&shaper.glyphs, &spaces) }, spaces, space_end);
+                }
                 end_of_paragraph(&mut push, shaper.glyphs.len(), end);
             }
             BreakOpportunity::Allowed if space_end > content_end => {
