@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Tolle lege: check</title>
+<style>
+body{margin:16px;font:13px/1.4 ui-monospace,monospace}
+#column{padding:0;margin:16px 0}
+.set{font-size:0;line-height:0}
+.set>span{display:inline-block;width:100%;vertical-align:top}
+.set>span>span{display:inline-block;width:100%;vertical-align:top;white-space:pre;
+font-kerning:normal;font-variant-ligatures:normal;font-synthesis:none;
+font-optical-sizing:none;letter-spacing:0;word-spacing:0}
+.set i{display:inline-block;width:0}
+.set s{display:inline-block;white-space:pre;text-decoration:none}
+</style>
+</head>
+<body>
+<!-- Sets a text at several widths and sizes and measures what the browser
+     made of it against what the typesetter asked for. The worst of each is
+     shown, and posted to /report for whoever is listening. -->
+<pre id="out">checking…</pre>
+<div id="column"><div id="lines"></div></div>
+<script type="module">
+import init, { Typesetter } from './pkg/calamus_web.js';
+
+const TEXT = `I heard from a neighbouring house a voice, as of boy or girl, I know not, chanting, and oft repeating, “Take up and read; Take up and read.” Instantly, my countenance altered, I began to think most intently whether children were wont in any kind of play to sing such words: nor could I remember ever to have heard the like.
+So checking the torrent of my tears, I arose; interpreting it to be no other than a command from God to open the book, and read the first chapter I should find. Well-known, off-the-shelf words; a fjord, an affliction, AVATAR To Ty.`;
+
+const report = { agent: navigator.userAgent };
+try {
+  const [, bytes] = await Promise.all([init(), fetch('./pkg/Inter-Regular.ttf').then((r) => r.arrayBuffer())]);
+  const typesetter = new Typesetter(new Uint8Array(bytes));
+  const face = new FontFace('f0', bytes);
+  document.fonts.add(await face.load());
+
+  const lines = document.getElementById('lines');
+  const PX = 96 / 72;
+  const worst = { lineEndPx: 0, baselinePx: 0, heightPx: 0, lineTopPx: 0 };
+  let copies = true, count = 0;
+  for (const justified of [true, false]) {
+    for (const size of [9, 12, 13, 17, 24]) {
+      for (const width of [150, 217.5, 300, 451.25]) {
+        lines.style.width = `${width}pt`;
+        lines.innerHTML = typesetter.set(TEXT, width, size, Math.round(size * 1.4), justified, true);
+        const set = lines.querySelector('.set');
+        const box = set.getBoundingClientRect();
+        const paragraphs = [...set.children];
+        for (const p of paragraphs) {
+          const ptop = p.getBoundingClientRect().top;
+          const kids = [...p.children];
+          let ltop = 0;
+          kids.forEach((line, k) => {
+            count++;
+            const lb = line.getBoundingClientRect();
+            worst.lineTopPx = Math.max(worst.lineTopPx, Math.abs(lb.top - ptop - ltop));
+            ltop += parseFloat(line.style.height) * PX;
+            // The baseline: where a box of no size sits at the line's end.
+            const probe = document.createElement('i');
+            line.firstElementChild.after(probe);
+            const baseline = probe.getBoundingClientRect().bottom - lb.top;
+            probe.remove();
+            const asked = parseFloat(line.firstElementChild.style.height) * PX;
+            worst.baselinePx = Math.max(worst.baselinePx, Math.abs(baseline - asked));
+            // Where the line's last word ends, against where the
+            // typesetter ended the line: what the browser's shaping and
+            // ours differ by, added up along the line.
+            let right = lb.left;
+            const walk = document.createTreeWalker(line, NodeFilter.SHOW_TEXT);
+            for (let n; (n = walk.nextNode()); ) {
+              if (n.parentElement.tagName === 'S' || !n.data.trim()) continue;
+              const r = document.createRange();
+              r.selectNodeContents(n);
+              right = Math.max(right, r.getBoundingClientRect().right);
+            }
+            worst.lineEndPx = Math.max(worst.lineEndPx, Math.abs(right - lb.left - Number(line.dataset.width) * PX));
+          });
+        }
+        const last = paragraphs.at(-1).lastElementChild.getBoundingClientRect();
+        worst.heightPx = Math.max(worst.heightPx, Math.abs(last.bottom - box.bottom));
+        const selection = getSelection();
+        selection.selectAllChildren(lines);
+        const copied = selection.toString();
+        if (copied !== TEXT) {
+          copies = false;
+          let at = 0;
+          while (copied[at] === TEXT[at]) at++;
+          report.copied ??= { at, of: TEXT.length, length: copied.length, got: copied.slice(Math.max(0, at - 20), at + 20), want: TEXT.slice(Math.max(0, at - 20), at + 20) };
+        }
+        selection.removeAllRanges();
+      }
+    }
+  }
+  Object.assign(report, { lines: count, copies }, worst);
+} catch (e) {
+  report.error = String(e);
+}
+document.getElementById('out').textContent = JSON.stringify(report, null, 1);
+fetch('/report', { method: 'POST', body: JSON.stringify(report) }).catch(() => {});
+</script>
+</body>
+</html>

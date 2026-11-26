@@ -139,13 +139,6 @@ impl Font {
         &self.data
     }
 
-    /// The font's ascent and descent as fractions of its em, descent
-    /// positive: what [`TextStyle::line_height`] is centred around.
-    pub(crate) fn ascent_descent(&self) -> (f64, f64) {
-        let em = f64::from(self.units_per_em);
-        (f64::from(self.ascender) / em, -f64::from(self.descender) / em)
-    }
-
     fn face(&self) -> rustybuzz::Face<'_> {
         rustybuzz::Face::from_slice(&self.data, self.index).expect("checked when the font was loaded")
     }
@@ -240,7 +233,7 @@ impl<'a> TextStyle<'a> {
 
     /// The same, for the glyphs set in `font`, one of this style's fonts: in
     /// CSS too, a fallback font's ascent and descent are its own.
-    pub(crate) fn extent_in(&self, font: &Font) -> (i64, i64) {
+    fn extent_in(&self, font: &Font) -> (i64, i64) {
         let ascent = font.scale(font.ascender, self.size);
         let descent = -font.scale(font.descender, self.size);
         let above = (self.line_height - (ascent + descent)).div_euclid(2) + ascent;

@@ -21,9 +21,6 @@
 //! What's rough:
 //! - Each font is in the page whole, as base64. A page of any length wants
 //!   them subsetted, or linked.
-//! - The baseline is where we put it only in browsers that take
-//!   `ascent-override` (not Safari, which uses the metrics it reads from
-//!   the font itself, usually the same).
 //! - A cluster no font has is our missing glyph, but the browser will look
 //!   for it in the system's fonts.
 //! - Face 0 of a collection only.
@@ -53,6 +50,9 @@ pub struct Page<'a> {
     pub margin: i64,
     /// The room between one paragraph and the next, in scaled points.
     pub gap: i64,
+    /// Whether each line says how wide the typesetter made it
+    /// (`data-width`, in points), for checking a browser's lines against.
+    pub widths: bool,
     pub paragraphs: &'a [Set<'a>],
 }
 
@@ -70,15 +70,14 @@ impl Page<'_> {
         out.push_str("</style>\n</head>\n<body>\n");
         let _ = writeln!(out, "<main style=\"margin:{}\">", pt(self.margin));
         self.write_body(&fonts, &mut out);
-        out.push_str("</main>\n</body>\n</html>\n");
+        out.push_str("\n</main>\n</body>\n</html>\n");
         out
     }
 
     /// Only the text: the `<div>` holding the lines, for a page that
     /// already has the fonts and the [`STYLE`] rules. The fonts' families
     /// there are `f0`, `f1` and so on, in the order the runs first use
-    /// them, each run's own font before its fallbacks; and each wants the
-    /// ascent and descent [`ascent_descent`] gives.
+    /// them, each run's own font before its fallbacks.
     pub fn body(&self) -> String {
         let fonts = Fonts::of(self.paragraphs);
         let mut out = String::new();
@@ -89,40 +88,38 @@ impl Page<'_> {
     fn write_body(&self, fonts: &Fonts, out: &mut String) {
         let height: i64 = self.paragraphs.iter().map(|p| p.paragraph.height).sum::<i64>()
             + self.gap * (self.paragraphs.len().saturating_sub(1)) as i64;
-        let _ = writeln!(out, "<div class=\"set\" style=\"width:{};height:{}\">", pt(self.width), pt(height));
-        let mut top = 0;
+        let _ = write!(out, "<div class=\"set\" style=\"width:{};height:{}\">", pt(self.width), pt(height));
         for (k, set) in self.paragraphs.iter().enumerate() {
-            let _ = write!(out, "<p style=\"top:{}\">", pt(top));
+            // Paragraphs are boxes in a row too, each as wide as the
+            // text, and not `<p>`: copying puts a line end of the
+            // browser's own after a `<p>` in some browsers (Firefox) and
+            // not in others, and we put in our own.
+            if k + 1 < self.paragraphs.len() && self.gap != 0 {
+                let _ = write!(out, "<span role=\"paragraph\" style=\"margin-bottom:{}\">", pt(self.gap));
+            } else {
+                out.push_str("<span role=\"paragraph\">");
+            }
             let cuts = cuts(set);
             for (i, line) in set.paragraph.lines.iter().enumerate() {
                 // A line end after every paragraph but the last, for the
                 // text to be copied with: the lines' boxes are as tall as
                 // they're told, so it moves nothing.
                 let ends_paragraph = i + 1 == set.paragraph.lines.len() && k + 1 < self.paragraphs.len();
-                write_line(set, line, &cuts, fonts, ends_paragraph, out);
+                write_line(set, line, &cuts, fonts, ends_paragraph, self.widths, out);
             }
-            out.push_str("</p>\n");
-            top += set.paragraph.height + self.gap;
+            out.push_str("</span>");
         }
-        out.push_str("</div>\n");
+        out.push_str("</div>");
     }
-}
-
-/// A font's ascent and descent as fractions of its em (descent positive):
-/// what a page gives the browser as `ascent-override` and
-/// `descent-override`, with a `line-gap-override` of nothing, so that it
-/// puts the baseline where the typesetter did.
-pub fn ascent_descent(font: &Font) -> (f64, f64) {
-    font.ascent_descent()
 }
 
 /// The rules the lines need, whatever the fonts.
 pub const STYLE: &str = "\
 html{-webkit-text-size-adjust:none;text-size-adjust:none}
 body{margin:0}
-.set{position:relative}
-.set p{position:absolute;left:0;width:100%;margin:0;font-size:0;line-height:0}
-.set p>span{display:inline-block;width:100%;vertical-align:top;white-space:pre;
+.set{font-size:0;line-height:0}
+.set>span{display:inline-block;width:100%;vertical-align:top}
+.set>span>span{display:inline-block;width:100%;vertical-align:top;white-space:pre;
 font-kerning:normal;font-variant-ligatures:normal;font-synthesis:none;
 font-optical-sizing:none;letter-spacing:0;word-spacing:0}
 .set i{display:inline-block;width:0}
@@ -152,17 +149,10 @@ impl<'a> Fonts<'a> {
         self.0.iter().position(|f| std::ptr::eq(*f, font)).expect("every run's fonts were gathered")
     }
 
-    /// An `@font-face` for each, with the ascent and descent we set by, so
-    /// the browser puts the baseline where we did.
+    /// An `@font-face` for each.
     fn write_faces(&self, out: &mut String) {
         for (i, font) in self.0.iter().enumerate() {
-            let (ascent, descent) = font.ascent_descent();
-            let _ = write!(
-                out,
-                "@font-face{{font-family:f{i};ascent-override:{}%;descent-override:{}%;line-gap-override:0%;src:url(data:font/ttf;base64,",
-                number(ascent * 100.0),
-                number(descent * 100.0),
-            );
+            let _ = write!(out, "@font-face{{font-family:f{i};src:url(data:font/ttf;base64,");
             base64::engine::general_purpose::STANDARD.encode_string(font.data(), out);
             out.push_str(")}\n");
         }
@@ -220,13 +210,26 @@ fn stretches(set: &Set, line: &Line, cuts: &[usize]) -> Vec<Stretch> {
     out
 }
 
-fn write_line(set: &Set, line: &Line, cuts: &[usize], fonts: &Fonts, ends_paragraph: bool, out: &mut String) {
+fn write_line(
+    set: &Set,
+    line: &Line,
+    cuts: &[usize],
+    fonts: &Fonts,
+    ends_paragraph: bool,
+    widths: bool,
+    out: &mut String,
+) {
     // The line's box, and a strut as tall as the line reaches above its
-    // baseline: nothing on the line reaches higher, so the baseline is
-    // where we put it.
+    // baseline. The text asks for no height of its own (a line height of
+    // nothing), so the strut alone says where the baseline is, whatever
+    // the browser takes the font's ascent to be.
+    out.push_str("<span");
+    if widths {
+        let _ = write!(out, " data-width=\"{}\"", number(line.width as f64 / PT as f64));
+    }
     let _ = write!(
         out,
-        "<span style=\"height:{}\"><i style=\"height:{}\"></i>",
+        " style=\"height:{}\"><i style=\"height:{}\"></i>",
         pt(line.height),
         pt(line.baseline - line.top)
     );
@@ -247,9 +250,8 @@ fn write_line(set: &Set, line: &Line, cuts: &[usize], fonts: &Fonts, ends_paragr
             let style = &set.runs[s.run].style;
             let _ = write!(
                 out,
-                "<span style=\"font:{}/{} f{}\"",
+                "<span style=\"font:{}/0 f{}\"",
                 pt(style.size),
-                pt(style.line_height),
                 fonts.index(style.font_at(s.font)),
             );
             if let Some(language) = style.language {

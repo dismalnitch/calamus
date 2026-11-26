@@ -36,6 +36,7 @@ fn main() {
         width,
         margin: 36 * PT,
         gap: 16 * PT,
+        widths: false,
         paragraphs: &[
             Set { text: TEXT, runs: &plain, paragraph: &ragged },
             Set { text: TEXT, runs: &plain, paragraph: &justified },

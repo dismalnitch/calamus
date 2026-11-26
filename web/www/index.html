@@ -15,9 +15,9 @@ textarea{flex:1 1 280px;min-height:240px;padding:12px;border:1px solid #d6d2c8;b
 /* Drag the corner: the column is set again at every width. */
 #column{flex:0 1 auto;width:340px;max-width:100%;min-width:80px;box-sizing:border-box;padding:24px;resize:horizontal;overflow:hidden;background:#fff;border:1px solid #d6d2c8;border-radius:6px}
 /* The rules the typesetter's lines need (calamus::html::STYLE). */
-.set{position:relative}
-.set p{position:absolute;left:0;width:100%;margin:0;font-size:0;line-height:0}
-.set p>span{display:inline-block;width:100%;vertical-align:top;white-space:pre;
+.set{font-size:0;line-height:0}
+.set>span{display:inline-block;width:100%;vertical-align:top}
+.set>span>span{display:inline-block;width:100%;vertical-align:top;white-space:pre;
 font-kerning:normal;font-variant-ligatures:normal;font-synthesis:none;
 font-optical-sizing:none;letter-spacing:0;word-spacing:0}
 .set i{display:inline-block;width:0}
@@ -51,13 +51,8 @@ const [, bytes] = await Promise.all([
 const typesetter = new Typesetter(new Uint8Array(bytes));
 
 // The same font for the browser to paint with, under the family the lines
-// name, with the ascent and descent the typesetter set by.
-const percent = (n) => `${n * 100}%`;
-const face = new FontFace('f0', bytes, {
-  ascentOverride: percent(typesetter.ascent()),
-  descentOverride: percent(typesetter.descent()),
-  lineGapOverride: '0%',
-});
+// name.
+const face = new FontFace('f0', bytes);
 document.fonts.add(await face.load());
 
 const $ = (id) => document.getElementById(id);
@@ -68,8 +63,8 @@ function set() {
   if (width <= 0) return;
   const size = Number($('size').value);
   const start = performance.now();
-  $('lines').innerHTML = typesetter.set($('text').value, width, size, Math.round(size * 1.4), $('justified').checked);
-  const lines = $('lines').querySelectorAll('.set p>span').length;
+  $('lines').innerHTML = typesetter.set($('text').value, width, size, Math.round(size * 1.4), $('justified').checked, false);
+  const lines = $('lines').querySelectorAll('.set>span>span').length;
   $('note').textContent = `${lines} lines, ${width.toFixed(1)} pt wide, set in ${(performance.now() - start).toFixed(1)} ms`;
 }
 
