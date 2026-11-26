@@ -26,7 +26,9 @@ version = "0.1.0"
 dependencies = [
  "demerits",
  "mamre-rope",
+ "mamre-text",
  "rustybuzz",
+ "unicode-bidi",
  "unicode-linebreak",
  "unicode-segmentation",
 ]
@@ -60,19 +62,38 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 [[package]]
 name = "mamre"
 version = "0.1.0"
-source = "git+https://github.com/dismalnitch/mamre?rev=2bc0c541#2bc0c541e5d256575221ea9848da4639c2ce0220"
+source = "git+https://github.com/dismalnitch/mamre?rev=3cd0593#3cd0593ab234c5772d96c3dc7b36313daf8cfb85"
 dependencies = [
  "arrayvec",
 ]
 
 [[package]]
+name = "mamre-egg-walker"
+version = "0.1.0"
+source = "git+https://github.com/dismalnitch/mamre?rev=3cd0593#3cd0593ab234c5772d96c3dc7b36313daf8cfb85"
+dependencies = [
+ "mamre",
+]
+
+[[package]]
 name = "mamre-rope"
 version = "0.1.0"
-source = "git+https://github.com/dismalnitch/mamre?rev=2bc0c541#2bc0c541e5d256575221ea9848da4639c2ce0220"
+source = "git+https://github.com/dismalnitch/mamre?rev=3cd0593#3cd0593ab234c5772d96c3dc7b36313daf8cfb85"
 dependencies = [
  "arrayvec",
  "mamre",
+ "unicode-properties",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "mamre-text"
+version = "0.1.0"
+source = "git+https://github.com/dismalnitch/mamre?rev=3cd0593#3cd0593ab234c5772d96c3dc7b36313daf8cfb85"
+dependencies = [
+ "mamre",
+ "mamre-egg-walker",
+ "mamre-rope",
 ]
 
 [[package]]
@@ -107,6 +128,12 @@ checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 dependencies = [
  "core_maths",
 ]
+
+[[package]]
+name = "unicode-bidi"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c1cb5db39152898a79168971543b1cb5020dff7fe43c8dc468b0885f5e29df5"
 
 [[package]]
 name = "unicode-bidi-mirroring"
