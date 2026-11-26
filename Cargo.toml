@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 demerits = { git = "https://github.com/Ganderworks/demerits", rev = "d555ac9", version = "0.1.0" }
-mamre-rope = { git = "https://github.com/dismalnitch/mamre", rev = "2bc0c541", version = "0.1.0" }
+mamre-rope = { git = "https://github.com/dismalnitch/mamre", rev = "cdb7b92b", version = "0.1.0" }
 rustybuzz = "0.20.1"
 unicode-linebreak = "0.1.5"
 unicode-segmentation = "1.13.3"

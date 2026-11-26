@@ -118,83 +118,115 @@
 //! text, x never decreases along the stops; no stop lies past the line's
 //! width.
 //!
+use mamre_rope::{Edge, Rope, Unit};
 
-use std::fmt::Result;
-
-use crate::Buffer;
-use crate::buffer::Slice;
 use crate::units::{Heading, Offset};
-use unicode_segmentation::GraphemeIncomplete::{InvalidOffset, NextChunk, PreContext, PrevChunk};
-use unicode_segmentation::{GraphemeCursor, Graphemes};
 
 pub enum Affinity {
     Upstream,
     Downstream,
 }
 
-pub struct Caret<'a, Buffer> {
-    pub position: Offset,
-    pub affinity: Affinity,
-    text: &'a Buffer,
+pub struct Motion<'a> {
+    caret: &'a mut Caret,
+    rope: &'a Rope,
 }
 
-// impl Default for Caret {
-//     fn default(text: &str) -> Self {
-//         Self {
-//             position: Offset {
-//                 offset: 0,
-//                 due: Heading::East,
-//                 text: text,
-//             },
-//             affinity: Affinity::Downstream,
-//         }
-//     }
-// }
+impl<'a> Motion<'a> {
+    pub fn new(caret: &'a mut Caret, rope: &'a Rope) -> Self {
+        Self { caret, rope }
+    }
 
-impl<'a> Caret<'a, Buffer> {
-    pub fn new(text: &'a Buffer) -> Self {
+    pub fn left(&mut self, offset: usize) -> bool {
+        let Some(position) = self.rope.prev_grapheme_boundary(offset) else {
+            return false;
+        };
+        self.caret.position.offset = position;
+        true
+    }
+
+    pub fn right(&mut self, offset: usize) -> bool {
+        let Some(position) = self.rope.next_grapheme_boundary(offset) else {
+            return false;
+        };
+        self.caret.position.offset = position;
+        true
+    }
+
+    fn word(&mut self, heading: Heading) -> Option<usize> {
+        match heading {
+            Heading::East => {
+                self.rope
+                    .next_boundary(self.caret.position.offset, Unit::Word, Edge::Start)
+            }
+            Heading::West => {
+                self.rope
+                    .prev_boundary(self.caret.position.offset, Unit::Word, Edge::Start)
+            }
+            _ => None,
+        }
+    }
+
+    fn edge(&mut self, heading: Heading) -> Option<usize> {
+        match heading {
+            Heading::East => {
+                self.rope
+                    .next_boundary(self.caret.position.offset, Unit::Word, Edge::End)
+            }
+            Heading::West => {
+                self.rope
+                    .prev_boundary(self.caret.position.offset, Unit::Word, Edge::End)
+            }
+            _ => None,
+        }
+    }
+
+    fn sentence(&mut self, heading: Heading) -> Option<usize> {
+        match heading {
+            Heading::East => {
+                self.rope
+                    .next_boundary(self.caret.position.offset, Unit::Sentence, Edge::Start)
+            }
+            Heading::West => {
+                self.rope
+                    .prev_boundary(self.caret.position.offset, Unit::Sentence, Edge::Start)
+            }
+            _ => None,
+        }
+    }
+
+    fn paragraph(&mut self, heading: Heading) -> Option<usize> {
+        match heading {
+            Heading::East => {
+                self.rope
+                    .next_boundary(self.caret.position.offset, Unit::Sentence, Edge::Start)
+            }
+            Heading::West => {
+                self.rope
+                    .prev_boundary(self.caret.position.offset, Unit::Sentence, Edge::Start)
+            }
+            _ => None,
+        }
+    }
+}
+
+pub struct Caret {
+    pub position: Offset,
+    pub affinity: Affinity,
+
+    pub goal_x: u64,
+}
+
+impl Caret {
+    pub fn new() -> Self {
         Self {
             position: Offset {
                 offset: 0,
                 heading: Heading::East,
             },
             affinity: Affinity::Downstream,
-            text,
+            goal_x: 0,
+            // text,
         }
     }
-
-    pub fn mv_right(&mut self, offset: usize) -> bool {
-        let Some(position) = self.text.next_grapheme_boundary(offset) else {
-            return false;
-        };
-        self.position = position;
-        true
-    }
-
-    pub fn mv_left(&mut self, offset: usize) -> bool {
-        let Some(position) = self.text.prev_grapheme_boundary(offset) else {
-            return false;
-        };
-        self.position = position;
-        true
-    }
-
-    // interface:
-    // fn position - gets the caret position in em at this grapheme/glyph/cluster location
-    // fn line - gets the line index of this grapheme/glyph/cluster
-    // fn
-    // fn
-    // where is the cursor? (at this place in the text (rectangle))
-    // I touched <here>, which place in the text is that?
-    // which rectangles cover this selection? (boxes and spaces)
-    // what place is one line above this location? below?
-
-    // pub fn position(&self) {
-    //     if self.position.offset >= self.text.len() {
-    //         panic!("at the disco")
-    //     }
-    //     let g = self.text.grapheme_indices(true);
-    //     // self.text[self.position.offset]
-    //     todo!();
-    // }
 }

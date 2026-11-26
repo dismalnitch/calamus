@@ -60,7 +60,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 [[package]]
 name = "mamre"
 version = "0.1.0"
-source = "git+https://github.com/dismalnitch/mamre?rev=2bc0c541#2bc0c541e5d256575221ea9848da4639c2ce0220"
+source = "git+https://github.com/dismalnitch/mamre?rev=cdb7b92b#cdb7b92b0e2c081e2f14f0a0edd12939705593ab"
 dependencies = [
  "arrayvec",
 ]
@@ -68,10 +68,11 @@ dependencies = [
 [[package]]
 name = "mamre-rope"
 version = "0.1.0"
-source = "git+https://github.com/dismalnitch/mamre?rev=2bc0c541#2bc0c541e5d256575221ea9848da4639c2ce0220"
+source = "git+https://github.com/dismalnitch/mamre?rev=cdb7b92b#cdb7b92b0e2c081e2f14f0a0edd12939705593ab"
 dependencies = [
  "arrayvec",
  "mamre",
+ "unicode-properties",
  "unicode-segmentation",
 ]
 

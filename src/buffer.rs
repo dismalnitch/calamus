@@ -6,6 +6,7 @@
 use std::{fmt, range::Range};
 
 use mamre_rope::Rope;
+pub use mamre_rope::{Edge, Unit};
 
 use crate::units::{Heading, Offset};
 
@@ -103,6 +104,46 @@ impl Buffer {
         }
     }
 
+    /// The first `edge` of a `unit` after byte `at`: where the next word
+    /// starts, say. `None` if there's none before the end.
+    ///
+    /// "After" is a higher offset; which way that is on the page is the
+    /// layout's business. Words and sentences are found by scanning near
+    /// `at`; so are paragraphs and sections, as the rope counts nothing.
+    pub fn next_boundary(&self, at: usize, unit: Unit, edge: Edge) -> Result<Option<usize>, BufferError> {
+        self.check_offset(at)?;
+        Ok(self.rope.next_boundary(at, unit, edge))
+    }
+
+    /// The last `edge` of a `unit` before byte `at`: where the word the
+    /// cursor is in (or the one before) starts, say.
+    pub fn prev_boundary(&self, at: usize, unit: Unit, edge: Edge) -> Result<Option<usize>, BufferError> {
+        self.check_offset(at)?;
+        Ok(self.rope.prev_boundary(at, unit, edge))
+    }
+
+    /// The `unit` holding byte `at`, start to just past its end; `None`
+    /// between units (on a space between words, say) and at the end.
+    ///
+    /// The rope's `unit_at` finds units by number, which needs a measure
+    /// that counts them; this one counts nothing, so this goes by
+    /// neighbours: the last start at or before `at`, then the end after it.
+    pub fn unit_range_at(&self, at: usize, unit: Unit) -> Result<Option<Range<usize>>, BufferError> {
+        self.check_offset(at)?;
+        if at == self.len() {
+            return Ok(None);
+        }
+        let next_char = self.rope.char_to_offset(self.rope.offset_to_char(at) + 1);
+        let Some(start) = self.rope.prev_boundary(next_char, unit, Edge::Start) else {
+            return Ok(None);
+        };
+        Ok(self
+            .rope
+            .next_boundary(start, unit, Edge::End)
+            .filter(|&end| end > at)
+            .map(|end| Range { start, end }))
+    }
+
     /// Replaces the bytes in `range` with `text`. Returns the number of
     /// bytes added.
     pub fn replace(&mut self, range: Range<usize>, text: &str) -> Result<usize, BufferError> {
@@ -147,6 +188,16 @@ impl Buffer {
         Ok(Slice {
             text: self.rope.slice(at..end),
         })
+    }
+
+    /// Errors unless `at` is in bounds (the end counts) and a char
+    /// boundary.
+    fn check_offset(&self, at: usize) -> Result<(), BufferError> {
+        let len = self.len();
+        if at > len {
+            return Err(BufferError::OutOfBounds { at, len });
+        }
+        self.check_boundary(at)
     }
 
     /// Errors unless `at`, already known to be in bounds, is a char
@@ -250,5 +301,36 @@ mod tests {
                 "byte {at}"
             );
         }
+    }
+
+    #[test]
+    fn word_boundaries() {
+        let mut b = Buffer::new();
+        b.insert(0, "hello  wide world").unwrap();
+        assert_eq!(b.next_boundary(0, Unit::Word, Edge::End), Ok(Some(5)));
+        assert_eq!(b.next_boundary(5, Unit::Word, Edge::Start), Ok(Some(7)));
+        assert_eq!(b.prev_boundary(9, Unit::Word, Edge::Start), Ok(Some(7)));
+        assert_eq!(b.prev_boundary(0, Unit::Word, Edge::Start), Ok(None));
+        assert_eq!(b.next_boundary(12, Unit::Word, Edge::Start), Ok(None));
+    }
+
+    #[test]
+    fn unit_range_at_a_word_and_between() {
+        let mut b = Buffer::new();
+        b.insert(0, "hello  wide world").unwrap();
+        assert_eq!(b.unit_range_at(7, Unit::Word), Ok(Some(Range { start: 7, end: 11 })));
+        assert_eq!(b.unit_range_at(10, Unit::Word), Ok(Some(Range { start: 7, end: 11 })));
+        assert_eq!(b.unit_range_at(5, Unit::Word), Ok(None));
+        assert_eq!(b.unit_range_at(b.len(), Unit::Word), Ok(None));
+    }
+
+    #[test]
+    fn hebrew_words() {
+        // Two bytes a letter: שלום is 0..8, the space 8, עולם 9..17.
+        let mut b = Buffer::new();
+        b.insert(0, "שלום עולם").unwrap();
+        assert_eq!(b.unit_range_at(2, Unit::Word), Ok(Some(Range { start: 0, end: 8 })));
+        assert_eq!(b.next_boundary(0, Unit::Word, Edge::Start), Ok(Some(9)));
+        assert_eq!(b.next_boundary(1, Unit::Word, Edge::Start), Err(BufferError::NotCharBoundary { at: 1 }));
     }
 }
