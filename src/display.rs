@@ -41,7 +41,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 pub use crate::caret::Affinity;
 use crate::bidi::{self, Stretch};
-use crate::buffer::Isolate;
+use crate::buffer::{Isolate, Kind};
 use crate::layout::{Align, Font, Glyph, Run, Style, TextStyle, is_space, set_paragraph_bidi};
 
 /// A rectangle in scaled points, from the top-left of the text.
@@ -96,6 +96,11 @@ pub struct Line {
     pub width: i64,
     /// The first byte offset on the line.
     pub start: usize,
+    /// Which paragraph of the text it's a line of, counting from 0.
+    pub paragraph: usize,
+    /// The size its text is set at, in scaled points: a heading's is
+    /// larger than the display's.
+    pub size: i64,
     /// Every place the cursor can stand on the line, in text order. An
     /// offset with two places has two stops, the upstream one first: the
     /// end of a line broken with no space is that line's last stop and the
@@ -130,6 +135,21 @@ pub struct Display {
     width: i64,
     lines: Vec<Line>,
     height: i64,
+    /// What each paragraph is, in order; plain past the end.
+    kinds: Vec<Kind>,
+    /// Whether the text opens with a break that isn't shown: the one a
+    /// document starts with so its first paragraph can have a kind.
+    opening_hidden: bool,
+}
+
+/// How much larger than the text a kind is set, as a fraction.
+fn scale(kind: Kind) -> (i64, i64) {
+    match kind {
+        Kind::Heading(1) => (3, 2),
+        Kind::Heading(2) => (5, 4),
+        Kind::Heading(_) => (9, 8),
+        _ => (1, 1),
+    }
 }
 
 /// Where a caret stop is: its line, and which of the line's stops. A place
@@ -194,7 +214,18 @@ impl Display {
             width,
             lines: Vec::new(),
             height: 0,
+            kinds: Vec::new(),
+            opening_hidden: false,
         }
+    }
+
+    /// What each paragraph is, for the next [`Display::set`]: headings
+    /// are set larger, with room above. With `opening_hidden`, a text
+    /// that opens with a break doesn't show the empty paragraph before
+    /// it, and offset 0 has no place.
+    pub fn set_kinds(&mut self, kinds: Vec<Kind>, opening_hidden: bool) {
+        self.kinds = kinds;
+        self.opening_hidden = opening_hidden;
     }
 
     /// The text as set. Never empty once set: an empty text is one empty
@@ -386,16 +417,30 @@ impl Display {
             size: self.size,
             line_height: self.line_height,
         };
-        let paragraph_style = Style {
-            strut: style,
-            align: Align::Ragged,
-        };
-        let mut lines = Vec::new();
+        let mut lines: Vec<Line> = Vec::new();
         let mut top = 0i64;
         let mut start = 0usize;
         for (k, text) in text.split('\n').enumerate() {
             if k > 0 {
                 start += 1; // the line end
+            }
+            if k == 0 && self.opening_hidden && text.is_empty() && self.kinds.len() > 1 {
+                continue;
+            }
+            let kind = self.kinds.get(k).copied().unwrap_or(Kind::Text);
+            let (up, down) = scale(kind);
+            let style = TextStyle {
+                size: style.size * up / down,
+                line_height: style.line_height * up / down,
+                ..style
+            };
+            let paragraph_style = Style {
+                strut: style,
+                align: Align::Ragged,
+            };
+            // Room above a heading, unless it opens the text.
+            if kind.is_heading() && !lines.is_empty() {
+                top += self.line_height / 2;
             }
             let graphemes: Vec<usize> = text
                 .grapheme_indices(true)
@@ -417,7 +462,7 @@ impl Display {
                 len: text.len(),
                 style,
             }];
-            let set = set_paragraph_bidi(text, &runs, &paragraph_style, &[self.width], base, &levels, true);
+            let set = set_paragraph_bidi(text, &runs, &paragraph_style, &[self.width], base, &levels, true, true);
             let count = set.lines.len();
             for (i, line) in set.lines.iter().enumerate() {
                 let last = i + 1 == count;
@@ -449,6 +494,8 @@ impl Display {
                     baseline: top + line.baseline,
                     width: line.width,
                     start: start + line.text.start,
+                    paragraph: k,
+                    size: style.size,
                     stops: stops
                         .into_iter()
                         .map(|s| Stop {

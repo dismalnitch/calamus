@@ -24,8 +24,8 @@ use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::bidi::{self, Stretch};
-use crate::buffer::{Buffer, Edge, Isolate, Unit};
-pub use crate::buffer::Direction;
+use crate::buffer::{Buffer, BufferError, Edge, Isolate, Unit};
+pub use crate::buffer::{Direction, Kind, Section, SectionId};
 pub use crate::display::{Affinity, Display, Line, Place, Rect, Stop, StopIndex};
 use crate::layout::Font;
 
@@ -67,7 +67,31 @@ pub struct Editor {
     marked: Option<Range<usize>>,
     /// Every grapheme cluster boundary in the text, in order.
     boundaries: Vec<usize>,
+    /// Whether the text is a document ([`Editor::set_document`]).
+    document: bool,
 }
+
+/// A paragraph as set: what it is and where it is on the page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Block {
+    /// Its text, in bytes: after the break that starts it, up to the next.
+    pub range: Range<usize>,
+    pub kind: Kind,
+    /// Down from the top of the text, in scaled points.
+    pub top: i64,
+    pub height: i64,
+}
+
+/// What typed at the start of a plain paragraph, then a space, makes it.
+const SHORTHAND: [(&str, Kind); 7] = [
+    ("#", Kind::Heading(1)),
+    ("##", Kind::Heading(2)),
+    ("###", Kind::Heading(3)),
+    (">", Kind::Quote),
+    ("```", Kind::Code),
+    ("$$", Kind::Equation),
+    ("\u{201c}", Kind::Quote),
+];
 
 impl Editor {
     /// An editor for `text`, set in `font` (and `fallback` for what it
@@ -139,6 +163,7 @@ impl Editor {
             stays_put: false,
             marked: None,
             boundaries: Vec::new(),
+            document: false,
         }
     }
 
@@ -188,12 +213,169 @@ impl Editor {
     /// Replace `range` with `text`; the cursor goes after it, and any
     /// marked text is forgotten.
     pub fn replace(&mut self, range: Range<usize>, text: &str) {
+        let range = self.clamp(range);
+        // In a document, Return carries code and quotations on to the
+        // next paragraph, and in an empty one ends them.
+        let carried = (self.document && text == "\n")
+            .then(|| self.buffer.kind_at(range.start))
+            .filter(|k| matches!(k, Kind::Code | Kind::Quote));
+        if carried.is_some() && range.start == range.end && self.paragraph_at(range.start).is_empty() {
+            let _ = self.buffer.set_kind(range.start, Kind::Text);
+            self.layout();
+            self.marked = None;
+            return;
+        }
         let (start, added) = self.splice(range, text);
         self.selection = Range {
             start: start + added,
             end: start + added,
         };
         self.marked = None;
+        if let Some(kind) = carried {
+            let _ = self.buffer.set_kind(start + added, kind);
+            self.layout();
+        } else if self.document && text == " " {
+            self.shorthand();
+        }
+    }
+
+    // Documents: paragraphs and what they are
+
+    /// Makes the text a document: its paragraphs have kinds
+    /// ([`Editor::set_kind`]), headings are set larger, and Return,
+    /// Backspace and Markdown shorthand ("# ", "> ") change them.
+    ///
+    /// A document opens with a line break that isn't shown and can't be
+    /// deleted or selected: a paragraph's kind is kept on the break that
+    /// starts it, so the first paragraph needs one. It's in
+    /// [`Editor::text`], and offsets count it: the first place is 1.
+    pub fn set_document(&mut self, on: bool) {
+        self.document = on;
+        if on && !self.flat.starts_with('\n') {
+            self.buffer.insert(0, "\n").expect("0 is in bounds");
+            self.selection = Range {
+                start: self.selection.start + 1,
+                end: self.selection.end + 1,
+            };
+        }
+        self.layout();
+        self.set_selection(self.selection);
+    }
+
+    pub fn is_document(&self) -> bool {
+        self.document
+    }
+
+    /// What the paragraph the cursor's in is (the selection's first).
+    pub fn kind(&self) -> Kind {
+        self.buffer.kind_at(self.selection.start)
+    }
+
+    /// Makes every paragraph the selection touches a `kind`.
+    pub fn set_kind(&mut self, kind: Kind) {
+        let sel = self.selection;
+        for p in self.buffer.paragraphs() {
+            if p.starts.is_some() && p.range.start <= sel.end && sel.start <= p.range.end {
+                let _ = self.buffer.set_kind(p.range.start, kind);
+            }
+        }
+        self.layout();
+    }
+
+    /// Makes the paragraph a cursor at byte `at` would be in a `kind`,
+    /// leaving the selection alone.
+    pub fn set_kind_at(&mut self, at: usize, kind: Kind) {
+        let at = self.clamp(Range { start: at, end: at }).start;
+        let _ = self.buffer.set_kind(at, kind);
+        self.layout();
+    }
+
+    /// The paragraphs as set, in order: what each is, and where on the
+    /// page. In a document the hidden opening one is left out.
+    pub fn blocks(&self) -> Vec<Block> {
+        let paragraphs = self.buffer.paragraphs();
+        let mut out: Vec<Block> = Vec::new();
+        let mut last = None;
+        for line in self.display.lines() {
+            if last == Some(line.paragraph) {
+                let b = out.last_mut().expect("a line was seen");
+                b.height = line.top + line.height - b.top;
+                continue;
+            }
+            last = Some(line.paragraph);
+            let Some(p) = paragraphs.get(line.paragraph) else { continue };
+            out.push(Block {
+                range: Range { start: p.range.start, end: p.range.end },
+                kind: p.kind,
+                top: line.top,
+                height: line.height,
+            });
+        }
+        out
+    }
+
+    /// The text of the paragraph a cursor at `at` is in.
+    fn paragraph_at(&self, at: usize) -> &str {
+        let start = self.flat[..at].rfind('\n').map_or(0, |i| i + 1);
+        let end = self.flat[at..].find('\n').map_or(self.flat.len(), |i| at + i);
+        &self.flat[start..end]
+    }
+
+    /// After a space: if a plain paragraph so far is only Markdown's mark
+    /// for a kind, it becomes that kind and the mark goes.
+    fn shorthand(&mut self) {
+        let at = self.selection.start;
+        let start = self.flat[..at].rfind('\n').map_or(0, |i| i + 1);
+        let typed = &self.flat[start..at];
+        let Some(&(_, kind)) = SHORTHAND.iter().find(|(mark, _)| typed.strip_suffix(' ') == Some(mark)) else {
+            return;
+        };
+        if self.buffer.kind_at(at) != Kind::Text || self.buffer.set_kind(at, kind).is_err() {
+            return;
+        }
+        self.buffer.replace(Range { start, end: at }, "").expect("within the text");
+        self.layout();
+        self.selection = Range { start, end: start };
+    }
+
+    /// The sections of the text, in order: each a mark on the character
+    /// that starts it, with a level (1 the outermost).
+    pub fn sections(&self) -> Vec<Section> {
+        self.buffer.sections()
+    }
+
+    /// Makes the character at byte `at` start a section at `level` (0: no
+    /// section).
+    pub fn mark_section(&mut self, at: usize, level: u8) -> Result<SectionId, BufferError> {
+        self.buffer.mark_section(at, level)
+    }
+
+    /// Where section `id` runs: to the next section at its level or
+    /// above, or the end.
+    pub fn section_range(&self, id: SectionId) -> Option<Range<usize>> {
+        self.buffer.section_range(id)
+    }
+
+    /// Moves section `id`, subsections and all, to byte `to` (an offset
+    /// before the move). The cursor goes to where it starts now.
+    pub fn move_section(&mut self, id: SectionId, to: usize) -> Result<(), BufferError> {
+        let range = self.buffer.section_range(id).ok_or(BufferError::NoSuchSection)?;
+        self.move_text(range, to)
+    }
+
+    /// Moves the text in `range` to byte `to` (an offset before the
+    /// move): the same characters, so sections and isolates in them go
+    /// along. The cursor goes to where the text starts now, and marked
+    /// text is forgotten. To inside itself does nothing.
+    pub fn move_text(&mut self, range: Range<usize>, to: usize) -> Result<(), BufferError> {
+        self.buffer.move_text(range, to)?;
+        self.layout();
+        self.marked = None;
+        if to < range.start || to > range.end {
+            let start = if to > range.end { to - (range.end - range.start) } else { to };
+            self.set_selection(Range { start, end: start });
+        }
+        Ok(())
     }
 
     /// Delete the grapheme cluster before the cursor, or the selection.
@@ -202,6 +384,14 @@ impl Editor {
         let range = if sel.start != sel.end {
             sel
         } else if sel.start == 0 {
+            return;
+        } else if self.document && self.flat[..sel.start].ends_with('\n') && self.buffer.kind_at(sel.start) != Kind::Text {
+            // At the start of a heading or quotation: it goes back to
+            // plain text before it joins anything.
+            let _ = self.buffer.set_kind(sel.start, Kind::Text);
+            self.layout();
+            return;
+        } else if self.document && sel.start == 1 {
             return;
         } else {
             Range {
@@ -379,9 +569,11 @@ impl Editor {
         self.affinity = Affinity::Downstream;
         self.held = false;
         let len = self.len();
+        // A document's opening break isn't a place.
+        let floor = usize::from(self.document).min(len);
         let (a, b) = (
-            range.start.min(range.end).min(len),
-            range.start.max(range.end).min(len),
+            range.start.min(range.end).min(len).max(floor),
+            range.start.max(range.end).min(len).max(floor),
         );
         let start = self.boundary_at_or_before(a);
         let end = if a == b {
@@ -580,7 +772,9 @@ impl Editor {
             }
             at
         };
-        let (a, b) = (floor(range.start), floor(range.end));
+        // A document's opening break stays.
+        let least = usize::from(self.document).min(len);
+        let (a, b) = (floor(range.start).max(least), floor(range.end).max(least));
         Range {
             start: a.min(b),
             end: a.max(b),
@@ -838,6 +1032,12 @@ impl Editor {
             .map(|(i, _)| i)
             .chain(std::iter::once(self.flat.len()))
             .collect();
+        if self.document {
+            let kinds = self.buffer.paragraphs().into_iter().map(|p| p.kind).collect();
+            self.display.set_kinds(kinds, true);
+        } else {
+            self.display.set_kinds(Vec::new(), false);
+        }
         self.display.set(&self.flat, &self.buffer.isolates());
     }
 
@@ -882,6 +1082,151 @@ mod tests {
 
     fn r(start: usize, end: usize) -> Range<usize> {
         Range { start, end }
+    }
+
+    fn document(text: &str) -> Editor {
+        let mut e = editor(text, 300);
+        e.set_document(true);
+        e
+    }
+
+    fn kinds(e: &Editor) -> Vec<(Kind, String)> {
+        e.blocks().iter().map(|b| (b.kind, e.text()[b.range].to_string())).collect()
+    }
+
+    fn k(kind: Kind, s: &str) -> (Kind, String) {
+        (kind, s.to_string())
+    }
+
+    #[test]
+    fn a_document_opens_with_a_break_nobody_can_reach() {
+        let mut e = document("Title\nbody");
+        assert_eq!(e.text(), "\nTitle\nbody");
+        // Two paragraphs show, not three; the first place is 1.
+        assert_eq!(e.blocks().len(), 2);
+        assert_eq!(e.lines().len(), 2);
+        e.set_selection(r(0, 0));
+        assert_eq!(e.selection(), r(1, 1));
+        e.delete_backward();
+        assert_eq!(e.text(), "\nTitle\nbody");
+        // Typing over everything leaves the break.
+        e.replace(r(0, 11), "x");
+        assert_eq!(e.text(), "\nx");
+        // An empty document is one empty line.
+        let empty = document("");
+        assert_eq!((empty.text(), empty.lines().len(), empty.selection()), ("\n", 1, r(1, 1)));
+    }
+
+    #[test]
+    fn a_heading_is_set_larger_and_its_kind_follows_the_writer() {
+        let mut e = document("Title\nbody");
+        e.set_selection(r(3, 3));
+        e.set_kind(Kind::Heading(1));
+        assert_eq!(kinds(&e), [k(Kind::Heading(1), "Title"), k(Kind::Text, "body")]);
+        let (title, body) = (&e.lines()[0], &e.lines()[1]);
+        assert_eq!((title.size, body.size), (17 * PT * 3 / 2, 17 * PT));
+        assert!(title.height > body.height);
+
+        // Return at the heading's end: plain text under it.
+        e.set_selection(r(6, 6));
+        e.replace(r(6, 6), "\n");
+        assert_eq!(kinds(&e), [k(Kind::Heading(1), "Title"), k(Kind::Text, ""), k(Kind::Text, "body")]);
+        assert_eq!(e.kind(), Kind::Text);
+
+        // Backspace at a heading's start makes it plain, and only then joins.
+        e.set_selection(r(1, 1));
+        e.delete_backward();
+        assert_eq!(kinds(&e)[0], k(Kind::Text, "Title"));
+        assert_eq!(e.text(), "\nTitle\n\nbody");
+        e.set_selection(r(8, 8));
+        e.delete_backward();
+        assert_eq!(e.text(), "\nTitle\nbody");
+    }
+
+    #[test]
+    fn shorthand_and_a_selection_set_kinds() {
+        let mut e = document("");
+        for c in ["#", "#", " "] {
+            let at = e.selection().start;
+            e.replace(r(at, at), c);
+        }
+        assert_eq!((e.text(), e.kind(), e.selection()), ("\n", Kind::Heading(2), r(1, 1)));
+        // Only at a paragraph's start, and only in plain text.
+        e.replace(r(1, 1), "a > ");
+        assert_eq!((e.text(), e.kind()), ("\na > ", Kind::Heading(2)));
+
+        // Every paragraph the selection touches.
+        let mut e = document("one\ntwo\nthree");
+        e.set_selection(r(2, 6));
+        e.set_kind(Kind::Quote);
+        assert_eq!(kinds(&e), [k(Kind::Quote, "one"), k(Kind::Quote, "two"), k(Kind::Text, "three")]);
+    }
+
+    #[test]
+    fn return_carries_code_on_and_an_empty_line_ends_it() {
+        let mut e = document("let x;");
+        e.set_kind(Kind::Code);
+        e.set_selection(r(7, 7));
+        e.replace(r(7, 7), "\n");
+        assert_eq!(kinds(&e), [k(Kind::Code, "let x;"), k(Kind::Code, "")]);
+        e.replace(r(8, 8), "\n");
+        assert_eq!(kinds(&e), [k(Kind::Code, "let x;"), k(Kind::Text, "")]);
+        assert_eq!(e.text(), "\nlet x;\n");
+    }
+
+    #[test]
+    fn a_word_wider_than_the_page_breaks_inside_itself() {
+        let long = "asdf".repeat(16);
+        for document in [false, true] {
+            let mut e = editor(&format!("short {long} words"), 200);
+            if document {
+                e.set_document(true);
+                e.set_kind_at(1, Kind::Heading(1));
+            }
+            assert!(e.lines().len() > 2);
+            assert!(e.lines().iter().all(|l| l.width <= 200 * PT), "no line runs past the page");
+            // Every place is still on the page, and the text is whole.
+            let last = e.len();
+            assert!(e.caret_rect(Place::downstream(last)).x <= 200 * PT);
+            assert!(e.text().ends_with(" words"));
+        }
+        // A word that fits is never broken.
+        let e = editor("the quick brown fox jumps over the lazy dog", 120);
+        let starts: Vec<usize> = e.lines().iter().map(|l| l.start).collect();
+        assert!(starts[1..].iter().all(|&at| e.text()[..at].ends_with(' ')), "lines start after a space");
+    }
+
+    #[test]
+    fn a_section_moves_with_its_subsections_and_keeps_its_mark() {
+        let text = "One\none's text\nSub\nsub's text\nTwo\ntwo's text\n";
+        let mut e = editor(text, 300);
+        let at = |e: &Editor, word: &str| e.text().find(word).unwrap();
+        let one = e.mark_section(at(&e, "One"), 1).unwrap();
+        let sub = e.mark_section(at(&e, "Sub"), 2).unwrap();
+        let two = e.mark_section(at(&e, "Two"), 1).unwrap();
+        assert_eq!(e.section_range(one), Some(r(0, at(&e, "Two"))));
+        assert_eq!(e.section_range(sub), Some(r(at(&e, "Sub"), at(&e, "Two"))));
+
+        // Two goes above One; One takes Sub along.
+        e.move_section(two, 0).unwrap();
+        assert_eq!(e.text(), "Two\ntwo's text\nOne\none's text\nSub\nsub's text\n");
+        assert_eq!(e.selection(), r(0, 0));
+        let levels: Vec<(usize, u8)> = e.sections().iter().map(|s| (s.at, s.level)).collect();
+        assert_eq!(levels, [(0, 1), (at(&e, "One"), 1), (at(&e, "Sub"), 2)]);
+        assert_eq!(e.section_range(one), Some(r(at(&e, "One"), e.len())));
+
+        // And back: One, with Sub, to the top.
+        e.move_section(one, 0).unwrap();
+        assert_eq!(e.text(), text);
+        assert_eq!(e.section_range(sub), Some(r(at(&e, "Sub"), at(&e, "Two"))));
+
+        // Into itself does nothing; a section that's gone is an error.
+        let before = e.text().to_string();
+        e.move_section(one, 5).unwrap();
+        assert_eq!(e.text(), before);
+        e.mark_section(at(&e, "Sub"), 0).unwrap();
+        assert_eq!(e.move_section(sub, 0), Err(BufferError::NoSuchSection));
+        assert_eq!(e.sections().len(), 2);
     }
 
     #[test]
