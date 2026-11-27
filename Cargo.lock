@@ -68,7 +68,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 [[package]]
 name = "mamre"
 version = "0.1.0"
-source = "git+https://github.com/dismalnitch/mamre?rev=6dda006#6dda0060c960b9f83dad0dfe9339b56d1c448c20"
+source = "git+https://github.com/dismalnitch/mamre?rev=0c1f1ca#0c1f1ca605d6a49e7b22e354219e95e5c5018be8"
 dependencies = [
  "arrayvec",
 ]
@@ -76,7 +76,7 @@ dependencies = [
 [[package]]
 name = "mamre-egg-walker"
 version = "0.1.0"
-source = "git+https://github.com/dismalnitch/mamre?rev=6dda006#6dda0060c960b9f83dad0dfe9339b56d1c448c20"
+source = "git+https://github.com/dismalnitch/mamre?rev=0c1f1ca#0c1f1ca605d6a49e7b22e354219e95e5c5018be8"
 dependencies = [
  "mamre",
  "serde",
@@ -86,7 +86,7 @@ dependencies = [
 [[package]]
 name = "mamre-rope"
 version = "0.1.0"
-source = "git+https://github.com/dismalnitch/mamre?rev=6dda006#6dda0060c960b9f83dad0dfe9339b56d1c448c20"
+source = "git+https://github.com/dismalnitch/mamre?rev=0c1f1ca#0c1f1ca605d6a49e7b22e354219e95e5c5018be8"
 dependencies = [
  "arrayvec",
  "mamre",
@@ -97,7 +97,7 @@ dependencies = [
 [[package]]
 name = "mamre-text"
 version = "0.1.0"
-source = "git+https://github.com/dismalnitch/mamre?rev=6dda006#6dda0060c960b9f83dad0dfe9339b56d1c448c20"
+source = "git+https://github.com/dismalnitch/mamre?rev=0c1f1ca#0c1f1ca605d6a49e7b22e354219e95e5c5018be8"
 dependencies = [
  "mamre",
  "mamre-egg-walker",
