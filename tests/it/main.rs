@@ -10,6 +10,7 @@
 mod common;
 
 mod buffer;
+mod hebrew;
 // mod display;
 mod layout;
 // mod units;
