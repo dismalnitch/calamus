@@ -16,3 +16,6 @@ unicode-segmentation = "1.13.3"
 # and test builds.
 [profile.dev.package."*"]
 opt-level = 3
+
+[dev-dependencies]
+tiny-skia = "0.11"

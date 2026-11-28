@@ -11,6 +11,7 @@ mod common;
 
 mod buffer;
 mod hebrew;
+mod hebrew_marks;
 // mod display;
 mod layout;
 // mod units;
